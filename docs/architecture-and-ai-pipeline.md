@@ -1,96 +1,93 @@
 # Architecture & AI Pipeline
 
-Status: Approved for planning (rev 2) · Last updated 2026-11-22
-Related: [product-requirements.md](product-requirements.md) · [data-and-api.md](data-and-api.md) · [roadmap-and-testing.md](roadmap-and-testing.md) · [decisions.md](decisions.md)
+Status: Planning, rev 3 · Last updated 2026-11-22 · Generated from [plan.md](plan.md); edit plan.md first, then re-split.
 
-The backend language is **open decision D-01** (ASP.NET Core, Go, or all-TypeScript). Everything below is written language-neutral unless it says otherwise.
+Section numbers match `plan.md` (rev 3, the source). Where each section lives: Part A, §1–§4, §10 → product-requirements.md · §5–§7, §11 → architecture-and-ai-pipeline.md · §8–§9 → data-and-api.md · §12–§14, §16 → roadmap-and-testing.md · §15 → decisions.md
 
 ---
 
-## 1. Technology stack
+## 5. Technology stack
 
-### 1.1 Fixed choices (independent of D-01)
+### 5.1 Fixed choices
 
 | Layer | Choice | Why |
 |---|---|---|
-| Frontend | Next.js (App Router, current stable), TypeScript, Tailwind, shadcn/ui, Motion | Team preference. Mostly client components. |
-| Client state | TanStack Query, plus a small reducer state machine for the recorder | No global store needed. |
-| API types | `openapi.yaml` → `openapi-typescript` client | One source for the contract. |
-| Same-origin | **Next.js rewrites** `/api/*` → backend | First-party cookies, no CORS, no reverse proxy needed. |
-| PWA | Manifest + Serwist, caching the app shell only | Offline use is V1. |
-| DB | PostgreSQL 17 (managed) + `pg_trgm` | Trigram dedupe. No vector DB. |
-| AI ports | `Transcriber` and `TurnAnalyzer` interfaces in the backend | Swappable and mockable. |
-| Real-time | None. A 2-step HTTP flow (transcribe, then analyze) | SSE in V1. |
-| Logging | Structured JSON logs with transcript redaction. Run tables have `latency_ms`, `tokens`, and `cost_usd` columns. | OpenTelemetry is V1 hardening. |
-| Local dev | Docker Compose for Postgres | Only where it earns its place. |
-| STT bake-off | **Throwaway Python script** in `spikes/stt-bakeoff/`, using `jiwer` for WER/CER | Fast to write. Its outputs feed the real eval runner. |
+| Frontend | Next.js (App Router, current stable), TypeScript, Tailwind, shadcn/ui, Motion | Preference. Mostly client components. |
+| Client state | TanStack Query, plus a reducer state machine for the recorder | No global store. |
+| API contract | `api/openapi.yaml` (spec-first) → `openapi-typescript` client | One source for the contract. |
+| Same-origin | Next.js rewrites `/api/*` to the Go backend | First-party cookies, no CORS, no proxy. |
+| PWA | Manifest + Serwist (app-shell cache only) | Offline is V1. |
+| DB | PostgreSQL 17 (managed) + `pg_trgm` | Dedupe scoring. No vector DB. |
+| Real-time | None. Two HTTP steps (transcribe, then analyze) | SSE in V1. |
+| Logging | Go `log/slog` JSON with redaction. `latency_ms`/`tokens`/`cost_usd` columns. | OpenTelemetry is V1 hardening. |
+| Local dev | Docker Compose for Postgres. It is also used by the P0 eval runner for trigram scoring. | |
+| STT bake-off | Throwaway Python script, `spikes/stt-bakeoff/` with `jiwer` | Output feeds the Go eval runner. |
 
-**Not used:** Redis, queues, a vector DB, microservices, or agent frameworks. At this scale, one structured LLM call plus deterministic code is more reliable.
+**Not used:** Redis, queues, a vector DB, microservices, or agent frameworks.
 
-### 1.2 Backend language comparison (D-01, open)
+### 5.2 Backend: Go (D-01, decided)
 
-| Concern | ASP.NET Core (.NET 10 LTS) | Go (current stable) | All-TypeScript (Next.js route handlers) |
-|---|---|---|---|
-| HTTP | Minimal APIs | `net/http` (1.22+ routing) or chi | Route handlers |
-| DB | EF Core + Npgsql, EF migrations | `pgx` + `sqlc` (type-safe SQL), `goose` migrations | Drizzle + drizzle-kit |
-| Local dates | **NodaTime `LocalDate`** + tzdb, the best fit | `time` + `LoadLocation` with embedded `time/tzdata`. Needs a small civil-date type, for example `cloud.google.com/go/civil`. | Temporal polyfill or date-fns-tz |
-| Session auth (seeded users) | Cookie auth + password hasher | `alexedwards/scs` + bcrypt | iron-session + bcrypt |
-| LLM structured output | Official SDKs / Microsoft.Extensions.AI | Official Go SDKs from the major vendors, plus a JSON-schema validator such as `santhosh-tekuri/jsonschema` | Vercel AI SDK + Zod, the smoothest |
-| OpenAPI | Can be generated from code | Spec-first, with `oapi-codegen` for server stubs | Zod-to-OpenAPI, or shared types without OpenAPI |
-| Tests | xUnit + Testcontainers | `testing` + testcontainers-go, table tests | Vitest + Testcontainers |
-| Deployables | 2 (Next + API) | 2 (Next + one static binary) | 1 |
-| Learning value for us | Low, unless C# is a goal | **High: we're both learning Go** | Medium |
-| Speed to MVP | Medium | Medium at first, with about 20% learning overhead | Fastest |
-
-**Lean (not decided):**
-- **Go** fits well if learning it is a real goal and neither of us is already fluent in C#. The backend is mostly SQL plus an explicit validation pipeline. The rev-2 scope cuts also removed most of what ASP.NET's built-in features were buying: registration, OpenTelemetry, If-Match, and idempotency middleware. The costs are more hand-written code, a small civil-date type, and about 20% extra on the backend phases.
-- **ASP.NET Core** is the better pick if one of us is already productive in C# and shipping sooner matters more than learning.
-- **All-TypeScript** is the right call only if speed to a working MVP beats everything else.
-
-D-01 must be decided **before Phase 0**, because the domain core and the eval runner are written in the backend language.
-
-### 1.3 Backend layout (any language)
-
-| Module | Contents |
+| Concern | Choice |
 |---|---|
-| `domain` | Pure logic: date resolver, normalizer, dedupe, evidence matcher, policy, lifecycle, validator |
-| `app` | Use cases: Transcribe, AnalyzeTurn, ApplyProposals, Tasks |
-| `store` | Postgres access |
-| `ai` | Adapters behind the `Transcriber` and `TurnAnalyzer` ports |
-| `api` | HTTP handlers, session, and limits |
-| `cmd/eval` | Eval runner |
+| Language | Go (current stable) |
+| HTTP | `net/http` with Go 1.22+ pattern routing by default. Switch to `chi` only if middleware grouping gets awkward (decided in P1). |
+| DB access | `pgx` v5 + `sqlc` (type-safe queries from SQL files) |
+| Migrations | `goose` (SQL migrations) |
+| Local dates | A small `civil.Date` type (`cloud.google.com/go/civil` or our own), `time.LoadLocation` with an embedded `time/tzdata` |
+| Sessions | `alexedwards/scs` with a Postgres store, and `golang.org/x/crypto/bcrypt` for the seeded passwords |
+| LLM SDK | The official Go SDK of the chosen vendor, behind our `TurnAnalyzer` interface |
+| JSON Schema | Strict schema sent to the provider, re-validated server-side with `santhosh-tekuri/jsonschema`. Then a typed decode into Go structs per op type. |
+| OpenAPI server | Spec-first. `oapi-codegen` for request and response types, and optionally stubs. Handlers are hand-written. |
+| Rate limits | `golang.org/x/time/rate`, per user, in memory |
+| Tests | `testing` with table tests, plus `testcontainers-go` for Postgres |
 
-### 1.4 Speech-to-text: bake-off, then one adapter
+**Layout:**
+
+```
+cmd/api/                 HTTP server main
+cmd/eval/                eval runner
+internal/domain/         pure: dates, normalize, evidence, dedupe, policy, lifecycle, validate, templates
+internal/app/            use cases: Transcribe, AnalyzeTurn, ApplyProposals, Tasks
+internal/store/          sqlc-generated queries + pgx transactions
+internal/ai/             Transcriber + TurnAnalyzer adapters
+internal/httpapi/        handlers, session, limits
+db/migrations/           goose
+db/queries/              sqlc .sql
+api/openapi.yaml
+prompts/turn-analyzer/v1.md
+eval/golden/{dev,heldout}/
+web/                     Next.js app
+spikes/stt-bakeoff/      throwaway Python
+```
+
+**Purity boundary:** `domain` does no I/O. Trigram scores come from Postgres (`store`), and `domain` makes the decision from those scores, the dates, and the numbers.
+
+### 5.3 Speech-to-text: bake-off, then one adapter
 
 | Candidate | Why it's in the bake-off |
 |---|---|
-| OpenAI `gpt-4o-transcribe` / `-mini-transcribe` | Strong multilingual support and prompt biasing |
-| Groq-hosted Whisper large-v3 / turbo | Fastest and cheapest, with prompt biasing |
-| ElevenLabs Scribe | Reported to be strong on Arabic dialects |
-| Google Chirp `ar-EG` (optional) | Has a dialect locale |
-| Self-hosted faster-whisper | Not in the bake-off. Considered for V2 only if privacy or cost demands it. |
+| OpenAI `gpt-4o-transcribe` / `-mini-transcribe` | Strong multilingual support, prompt biasing |
+| Groq-hosted Whisper large-v3 / turbo | Fastest and cheapest, prompt biasing |
+| ElevenLabs Scribe | Reported strong on Arabic dialects |
+| Google Chirp `ar-EG` (optional) | Dialect locale |
+| Self-hosted faster-whisper | Not in the bake-off. V2, only if privacy or cost demands it. |
 
 **Method:**
-1. The Python script sends our **20 recorded clips** to each candidate.
-2. It records WER/CER, latency, and cost per minute.
-3. It also records **entity accuracy**: names, English terms, and numbers like "محاضرة 4".
-4. It writes `transcripts/<provider>.json`.
-5. The real eval runner reads those files and computes **downstream task F1** for each provider. The winner is chosen on downstream F1 first.
-6. Only the winner gets a production `Transcriber` adapter, built in Phase 3.
+1. The Python script sends our 20 clips to each candidate. It records WER/CER, entity accuracy (names, English terms, numbers), latency, and cost per minute. It writes `transcripts/<provider>.json`.
+2. The Go eval runner computes **downstream task F1** per provider from those files. The winner is chosen on downstream F1 first.
+3. Only the winner gets a Go `Transcriber` adapter (P3).
+4. Calls are biased with a short prompt of open task titles and names.
 
-Every call is biased with a short prompt listing open task titles and names.
+### 5.4 LLM
 
-### 1.5 LLM
+The choice is provider-agnostic. Requirements: strict JSON-schema output with `anyOf` support (for the op union), strong Egyptian Arabic, prompt caching, and no-training terms.
 
-The choice is provider-agnostic. The model needs strict JSON-schema output, strong Egyptian Arabic, prompt caching, and no-training API terms.
-
-- **Build one adapter** for the strongest candidate on a quick manual check.
-- **Add a second adapter only if the first misses the quality gate** after prompt iteration.
-- The model ID is pinned. Any change to the model or the prompt needs a passing eval run.
+- **Build one adapter.** A second is built only if the first misses the gate after 2 prompt iterations.
+- **Pin the model ID.** Any change to the model or prompt needs a passing eval on both splits.
 
 ---
 
-## 2. High-level architecture
+## 6. High-level architecture
 
 ```mermaid
 flowchart LR
@@ -100,13 +97,13 @@ flowchart LR
     UI[Day view · Talk · Plan Tray · Settings]
   end
   subgraph Next["Next.js server"]
-    RW[Rewrites /api/* → backend]
+    RW[Rewrites /api/* → Go API]
   end
-  subgraph API["Backend API (D-01)"]
-    EP[HTTP handlers\nsession · limits]
-    APP[Use cases\nTranscribe · AnalyzeTurn · ApplyProposals · Tasks]
-    DOM[Domain\nDateResolver · Policy · Normalizer · Dedupe · Lifecycle]
-    PORTS[Ports: Transcriber · TurnAnalyzer · Clock]
+  subgraph API["Go API"]
+    EP[httpapi\nsession · limits]
+    APP[app\nTranscribe · AnalyzeTurn · ApplyProposals · Tasks]
+    DOM[domain\nDates · Evidence · Dedupe · Policy · Lifecycle · Templates]
+    PORTS[Transcriber · TurnAnalyzer · Clock]
   end
   STT[(STT provider)]
   LLM[(LLM provider)]
@@ -121,13 +118,11 @@ flowchart LR
   APP --> PG
 ```
 
-### 2.1 Primary voice turn
-
 ```mermaid
 sequenceDiagram
   actor U as User
   participant C as Client
-  participant A as API
+  participant A as Go API
   participant S as STT
   participant L as LLM
   participant D as Postgres
@@ -143,233 +138,271 @@ sequenceDiagram
   C->>A: POST /conversations/{id}/messages (clientMessageId, transcriptionId)
   A->>D: insert message ON CONFLICT(clientMessageId) → stored result
   A->>D: load context (tasks, pending tray, last turns, settings)
-  A->>L: analyze(context, transcript) → strict JSON
-  L-->>A: {reply, operations[], clarification}
-  A->>A: validate → refs → dates → evidence → dedupe → policy
-  A->>D: tx: analysis_run + proposal_items + assistant message
-  A-->>C: {assistantMessage, tray, workload}
-  U->>C: tap "Add 4 to Tuesday"
-  C->>A: POST /proposal-items/apply
-  A->>D: tx: items pending→applied (guarded) + tasks + task_events
-  A-->>C: applied task ids
+  A->>L: analyze(context) → strict JSON (reply, clarification, ops union)
+  L-->>A: output
+  A->>A: decode → refs → evidence locate → dates → dedupe → policy → tray summary template
+  A->>D: tx: analysis_run (reason codes only) + proposal_items + assistant message
+  A-->>C: {assistantMessage, tray}
+  U->>C: tap apply
+  C->>A: POST /proposal-items/apply (itemId+revision+decision)
+  A->>D: tx: lock conversation → check all → commit all or nothing → ack template
+  A-->>C: 200 {applied, acknowledgement} or 409 {conflicts}
 ```
 
-The turn uses two HTTP steps instead of one. The transcript appears in 1–3 s, which gives a chance to correct it. Each step can be retried on its own, with no WebSocket needed.
+Two HTTP steps let the transcript show in 1–3 s, with a chance to fix it. Each step can be retried on its own.
 
 ---
 
-## 3. AI conversation & task extraction
+## 7. AI conversation & task extraction
 
-### 3.1 Design stance
+### 7.1 Design stance
 
-There is one **structured turn-analysis call** per user message. It returns the reply and the operations together. Deterministic code then decides what reaches the user: the model proposes, and the code disposes.
+**One call per turn.** One structured turn-analysis call per user message returns the reply, a nullable clarification, and typed ops. Deterministic code decides what reaches the user.
 
-If evaluation shows that generating the reply hurts extraction, the call gets split into extraction and then reply. The split happens behind the same port, with no API change.
+**Templates around the reply:** The server, not the model, writes:
+- the tray summary, such as "اقترحتلك ٤ حاجات، راجعها وأكد"
+- the date line between 00:00 and 04:00
+- the post-apply acknowledgement
 
-### 3.2 Context sent to the model
+That way, no count or persistence claim can come from the model. If evaluation shows reply generation hurting extraction, the call is split behind the same interface.
 
-The server builds this context for each turn.
+### 7.2 Context sent to the model
 
-- **System prompt.** A versioned file in the repo, `prompts/turn-analyzer/v1.md`.
-  - Contents: the rules, op semantics, splitting rules, language policy, 6–10 few-shot examples, and the schema.
-  - **Few-shot examples never overlap the golden set.**
-  - It tells the model to **write numbers in titles as digits**, which supports number-aware dedupe.
-- **Clock block.** Timezone, local now, logical today and tomorrow with Arabic and English weekday names, and week start.
-- **Tasks.** Open tasks from logical today −1 to +14 days, plus Later tasks.
-  - If there are more than 40, they are filtered by trigram match against the transcript.
-  - Each task gets an alias `T1..Tn`. **The model never sees UUIDs.**
-- **Pending tray.** Items aliased `P1..Pn`, each with its fields and its **open clarification question**, if any.
-- **Conversation.** The last 10 turns of the session. User messages are labelled `U-0` (current), `U-1`, `U-2`, and so on.
-- **Current message.** The text, plus whether it came from voice or text.
+- **System prompt:** `prompts/turn-analyzer/v1.md`. It holds the rules, op semantics, splitting rules, language policy, and 6–10 few-shot examples that never overlap the golden set.
+  - Prompt rules:
+    - Write numbers in titles as digits.
+    - Write titles in the language the user spoke, keeping English technical terms in Latin script as spoken.
+    - The reply must not mention counts, must not claim anything was saved or added, and must not repeat the clarification question.
+- **Clock block:** Timezone, local now, logical today and tomorrow with Arabic and English weekday names, and week start.
+- **Tasks:** Open tasks from logical today −1 to +14 days, plus Later. They are trigram-filtered if there are more than 40, and aliased `T1..Tn`. The model never sees UUIDs.
+- **Pending tray:** Items aliased `P1..Pn`, with fields and the open clarification question.
+- **Conversation:** The last 10 turns. User messages are labelled `U-0` (current), `U-1`, `U-2`, and so on.
+- **Current message:** The text, and whether it came from voice or text.
 
-### 3.3 Output schema (strict JSON schema; illustrative)
+### 7.3 Output schema: a discriminated union (illustrative)
+
+Top level:
 
 ```json
 {
-  "reply": "string (user's language, ≤ 600 chars)",
-  "clarification": { "question": "string", "about_ops": ["op1"] },
-  "operations": [
-    {
-      "op_id": "op1",
-      "type": "create | update_task | reschedule_task | complete_task | cancel_task | revise_proposal | withdraw_proposal",
-      "target": "T3 | P2 | null",
-      "title": "string | null",
-      "description": "string | null",
-      "date": { "kind": "none | relative_day | weekday | absolute | later | unresolved",
-                "offset": 1, "weekday": "thu", "which": "this | next | nearest",
-                "year": null, "month": null, "day": null, "text": "الخميس الجاي" },
-      "deadline": null,
-      "priority": "high | medium | low | null",
-      "estimate_minutes": 90,
-      "estimate_source": "stated | inferred | null",
-      "commitment": "definite | tentative | aspiration",
-      "evidence": [ { "message": "U-0", "quote": "verbatim span" } ],
-      "duplicate_of": "T5 | P1 | null",
-      "confidence": 0.0
-    }
-  ]
+  "reply": "string (user's language, ≤ 600 chars, suggestion language only)",
+  "clarification": null,
+  "operations": [ "<one of the op variants below>" ]
 }
 ```
 
-- `clarification` is nullable.
-- `deadline` uses the same DateExpr shape as `date`.
-- A turn of pure venting returns `operations: []`.
-- `evidence` is a list, so one op can cite several messages. For example, "Docker" can come from `U-1` and "خليها الخميس" from `U-0`.
+`clarification` is either `null` or `{ "question": "string", "about": ["P5"] }`. It is **not an op**. Its `about` field may name pending items or `op_id`s from this output.
 
-### 3.4 Classification rules
+Shared op fields: `op_id`, `type` (the discriminator), `evidence: [{ "message": "U-0|U-1|U-2", "quote": "verbatim span" }]`, and `confidence` (0–1). **The model never returns offsets.** Every variant sets `additionalProperties: false`.
 
-These rules live in the prompt and are verified by evaluation.
+| `type` | Required | Optional |
+|---|---|---|
+| `create` | `title`, `date` (DateExpr), `commitment` (definite\|tentative\|aspiration) | `description`, `deadline` (DateExpr), `priority`, `estimate_minutes` + `estimate_source` (stated\|inferred), `duplicate_of` (T#\|P#) |
+| `update_task` | `target` (T#), and at least one of `set` / `clear` | `set: {title?, description?, priority?, estimate_minutes?, deadline?}`, `clear: ["description" \| "estimate_minutes" \| "deadline"]` |
+| `reschedule_task` | `target` (T#), `date` (DateExpr, `later` allowed) | |
+| `complete_task` | `target` (T#) | |
+| `cancel_task` | `target` (T#) | |
+| `revise_proposal` | `target` (P#), and at least one of `set` / `clear` | `set: {title?, description?, date?, deadline?, priority?, estimate_minutes?, commitment?}`, `clear: [...]` |
+| `withdraw_proposal` | `target` (P#) | |
 
-| Utterance pattern | Op |
-|---|---|
-| **Context** ("عندي امتحان بكرة") | No op. The reply may offer help. |
-| **Commitment with an action** ("لازم / المفروض / هعمل / محتاج أ…") | `create`, `definite` |
-| **Tentative** ("ممكن / لو لقيت وقت / بفكر") | `create`, `tentative`. Policy puts it under Maybe. |
-| **Aspiration** ("نفسي / عايز في يوم") | `create`, `aspiration`, only when there is a concrete action. Otherwise the reply mentions it and no op is made. |
-| **Emotion** | Never an op |
-| **Negation plus a new date** ("مش هعمل X بكرة، خليها الجمعة") | `reschedule_task`, never cancel + create |
-| **Negation alone** ("مش هعمل X خلاص") | `cancel_task` |
-| **Past completion** ("خلصت / عملت") | `complete_task` |
-| **Correction** ("لا قصدي…") | `revise_proposal` if the target is a pending item, `update_task` if it is already applied |
-| **Clarification answer** ("خليها الخميس" after "Docker: بكرة ولا يوم تاني؟") | `revise_proposal` on the item the question was about. It sets the date and upgrades the commitment to `definite`. |
-| **Enumerable counts** ("محاضرتين") | Split into N creates when N ≤ 5, each numbered in the title with digits |
-| **Estimates** | `stated` only if the user said a duration. `inferred` estimates are shown with "~" in a muted style. |
+**`set`/`clear` semantics:**
+- A field that is **absent from both is unchanged**. Omission never clears a field.
+- A field may not appear in both.
+- `update_task` cannot change the date. Date changes go through `reschedule_task`.
 
-### 3.5 Deterministic validation pipeline
+**DateExpr:** `{ "kind": "relative_day", "offset": 1 }` | `{ "kind": "weekday", "weekday": "thu", "which": "this|next|nearest" }` | `{ "kind": "absolute", "month": 12, "day": 5, "year": null }` | `{ "kind": "later" }` | `{ "kind": "unresolved", "text": "الأسبوع الجاي" }`.
 
-The server runs these steps in order.
+The schema is sent to the provider as `anyOf` variants with a `const` discriminator. The server re-validates it, then decodes into one Go struct per variant.
 
-1. **Schema validation.** Provider strict mode, then the server validates again.
-2. **Reference resolution.** `T#` and `P#` aliases map to real IDs. An unknown alias drops the op and logs it. An ambiguous target becomes a clarification.
-3. **Evidence check.**
-   - Each `evidence` entry must reference one of the **last 3 user messages** (`U-0`, `U-1`, `U-2`) of the current conversation.
-   - After normalization (§3.7), its quote must fuzzy-match a span of that message with similarity ≥ 0.8.
-   - At least one entry must pass, or the op is dropped and logged. This is the main guard against invented tasks.
-   - **Guard against re-proposing old content:** A `create` whose evidence is *only* in `U-1` or `U-2` must survive dedupe against everything already proposed or applied from those messages. In practice, that only lets through things the earlier analysis missed.
-4. **Date resolution** (§3.6). A past date becomes a clarification. A date more than 365 days out gets flagged. `unresolved` goes to Later with a clarification.
-5. **Field sanity.** Titles are 2–120 chars, estimates 5–600 min, and enum values must be valid.
-6. **Lifecycle rules.** A cancelled task can't be completed. A completed task can't be rescheduled. A create can't have a target.
-7. **Dedupe.** A create is checked against open tasks, pending tray items, and *other items in the same run*.
-   - `numbersMatch`: the multiset of digit tokens in the normalized titles is equal.
-     - "lecture 1" vs "lecture 2" → false.
-     - "lecture ٤" vs "lecture 4" → true after normalization.
-     - No numbers on either side → true.
-   - `dateCompatible`: |Δdate| ≤ 1 day, or either date is Later (null).
-   - **It is a duplicate if** (`trigram ≥ 0.55` **AND** `dateCompatible` **AND** `numbersMatch`) **OR** (`duplicate_of` is set and resolves **AND** `numbersMatch`).
-   - A number mismatch overrides the model's `duplicate_of`.
-   - A duplicate becomes a notice ("Already on Tuesday: …"), never an insert.
-8. **Policy.** See the table below.
-9. **Persist atomically.** The run, the items, and the assistant message go in one transaction.
+### 7.4 Classification rules (in prompt, verified by eval)
+
+- **Context** ("عندي امتحان بكرة"): no op. The reply may offer help.
+- **Commitment with an action** ("لازم / المفروض / هعمل / محتاج أ…"): `create`, definite.
+- **Tentative** ("ممكن / لو لقيت وقت / بفكر"): `create`, tentative. It goes to Maybe.
+- **Aspiration** ("نفسي / عايز في يوم"): `create` with `aspiration`, but only if there is a concrete action. Otherwise the reply mentions it and no op is emitted.
+- **Emotion:** never an op.
+- **Negation plus a new date:** `reschedule_task`. **Negation alone:** `cancel_task`. **Past completion:** `complete_task`.
+- **Correction** ("لا قصدي…"): `revise_proposal` on a pending item, or `update_task` on an applied one.
+- **Clarification answer** ("خليها الخميس"): `revise_proposal` on the item the question was about. It sets the date and changes commitment to definite. If that item was already applied, it is `reschedule_task` instead.
+- **Unsure which task is meant:** emit a `clarification` and no op for that target. Never guess.
+- **Enumerable counts** ("محاضرتين"): N creates when N ≤ 5, numbered with digits.
+- **Estimates:** `stated` only if the user said a duration. `inferred` is shown with "~".
+
+### 7.5 Deterministic validation pipeline (server)
+
+1. **Schema validation and typed decode.** Unknown properties, invalid combinations, or a field in both `set` and `clear` cause the op to be dropped with a reason code.
+2. **Reference resolution.** Aliases map to real IDs from this request's context snapshot. If the target is unknown, or of the wrong kind (T vs P), the op is dropped with reason code `bad_target`. Ops named in `clarification.about` are not shown.
+3. **Evidence location (the server computes offsets).**
+   - Each evidence entry must name `U-0`, `U-1`, or `U-2`.
+   - The server normalizes the quote and that message (§7.7). It looks for an exact substring first, then a best approximate-substring match (edit-distance ratio ≥ 0.8).
+   - A found span is mapped back through the normalization offset map, giving original-text **code-point offsets** `{message_id, message_revision, start, end}`.
+   - At least one entry must be located, or the op is dropped (reason code `evidence_not_found`).
+   - The **displayed quote is always the original message substring at those offsets**, never the model's quote text.
+   - **Re-proposal guard:** A `create` whose located evidence is *only* in `U-1`/`U-2` is checked against **every item that came from those messages, whatever its status**: pending, applied, **rejected**, **withdrawn**, or superseded. The check is title match only (§7.5.1 score ≥ 0.84 AND numbersMatch), ignoring dates. A match drops the op with reason code `reproposal_of_earlier_item` and shows no notice.
+4. **Date resolution** (§7.6). A past date for `create`/`reschedule` leads to a clarification. A date more than 365 days out is flagged. `unresolved` goes to Later with a clarification.
+5. **Field sanity.** Title 2–120 chars. Estimate 5–600 min. Valid enums.
+6. **Lifecycle rules.** No completing a cancelled task. No rescheduling a completed task.
+7. **Dedupe** (§7.5.1): a create is checked against open tasks, pending items, and other items in the same run.
+8. **Policy** (table below).
+9. **Templates.** The tray summary and the night date line are built from the validated items.
+10. **Persist atomically.** The run (with reason codes), the items, and the assistant message are written in one transaction. **No `raw_output` is stored.**
 
 | Op | Condition | Tray presentation |
 |---|---|---|
-| create | definite + evidence ok + date resolved + not duplicate + confidence ≥ 0.5 | Pre-checked |
+| create | definite + evidence located + date resolved + not duplicate + confidence ≥ 0.5 | Pre-checked |
 | create | tentative / aspiration | "Maybe", unchecked |
-| create | confidence < 0.5 (otherwise valid) | "Maybe", unchecked, **low-confidence flag**, logged for evaluation |
-| reschedule / update / cancel / complete | target resolved uniquely | Change row (before → after), pre-checked, needs the apply tap |
-| any modify | target ambiguous | No item. A clarification is asked. |
-| revise / withdraw proposal | target pending | Applied to the tray item, with the change highlighted |
+| create | confidence < 0.5 (otherwise valid) | "Maybe", unchecked, low-confidence flag |
+| reschedule / update / cancel / complete | target valid | Change row (before → after), pre-checked |
+| any | referenced in `clarification.about` | Not shown. The question is shown instead. |
+| revise / withdraw proposal | target pending | Applied to the tray item. Revision +1. Change highlighted. |
 
-### 3.6 Failure handling (MVP, single provider)
+**Failure handling:**
+- **LLM timeout or 5xx:** 1 retry with backoff.
+- **Schema-invalid output:** 1 repair retry with the error codes attached.
+- **Still failing:** The message is saved, the run is marked `failed`, and the user sees a templated "اتسجل كلامك بس معرفتش أرتبه، تحب أجرب تاني؟" with Retry. The analysis budget is 20 s.
+- **STT failure:** 1 retry. The audio stays in IndexedDB, and the user can retry or type instead.
 
-- **LLM timeout or 5xx:** one retry with backoff.
-- **Output fails schema validation:** one repair retry, with the validation errors attached.
-- **Both retries fail:**
-  - The message is still saved.
-  - The assistant says "I saved what you said but couldn't organize it. Retry?"
-  - The run is marked `failed`.
-- **Time budget:** 20 s for the analysis step.
-- **STT failure:** one retry. The audio stays in IndexedDB, and the user is offered "retry" or "type instead".
-- **Provider fallback chain:** V1 hardening.
+#### 7.5.1 Dedupe rule and measured threshold
 
-### 3.7 Date & timezone handling
+**Score:** `s(a, b) = GREATEST(similarity(a,b), word_similarity(a,b), word_similarity(b,a))`. It is computed by pg_trgm on `title_normalized`. It is symmetric because either side can be the shorter title.
 
-**Storage.** `scheduled_date` and `deadline_date` are SQL `date` values, meaning local calendar days. `deadline_time` is optional. Instants are `timestamptz` in UTC.
+- **numbersMatch:** The multiset of digit tokens in the two normalized titles is equal. Titles with no digits on either side count as matching.
+- **dateCompatible:** The dates are within ±1 day of each other, or either date is Later.
 
-**Logical today** is `localNow.time < dayBoundary ? localNow.date − 1 : localNow.date`. The default boundary is 04:00.
+**A pair is a duplicate if** (`s ≥ 0.84` AND `dateCompatible` AND `numbersMatch`) **OR** (`duplicate_of` resolves AND `numbersMatch`). A number mismatch overrides the model's `duplicate_of`.
 
-**Resolver rules.** This is a pure function in `domain`, tested with tables.
+**Measured scores.** These come from PostgreSQL 17 (`postgres:17-alpine`) with pg_trgm, run on 2026-11-22, on titles normalized per §7.7.
 
-| Expression | Example | Resolves to |
-|---|---|---|
-| `relative_day n` | النهاردة 0, بكرة +1, بعد بكرة +2 | logicalToday + n |
-| `weekday X nearest/next` | "الخميس الجاي" | The nearest X strictly after logicalToday. Said on a Thursday, it means the following Thursday. |
-| `weekday X this` | "الخميس ده" | The X in the current week (weeks start Saturday). If that day has passed, it becomes a clarification. |
-| `absolute` without a year | "يوم 5 ديسمبر" | The next occurrence on or after today |
-| Week or month phrases | "الأسبوع الجاي", "آخر الشهر" | `later`, plus a clarification (MVP) |
+| Pair | Expected | similarity | wsim a→b | wsim b→a | **s** |
+|---|---|---|---|---|---|
+| R1 "review os lecture 1" / "…lecture 2" | distinct (numbers) | 0.818 | 0.900 | 0.900 | 0.900 |
+| R2 "review os lecture 4" / "…lecture ٤" (normalized → 4) | dup | 1.000 | 1.000 | 1.000 | 1.000 |
+| R3 "reply to ahmed" / "reply to ahmed about the project" | dup | **0.484** | 1.000 | 0.484 | **1.000** |
+| R4 "reply to ahmed" Tue / Sat | distinct (date) | 1.000 | 1.000 | 1.000 | 1.000 |
+| R5 `duplicate_of` lecture 1 → lecture 2 | distinct (numbers) | 0.818 | 0.900 | 0.900 | 0.900 |
+| N1 "reply to ahmed" / "reply to khaled" | distinct | 0.476 | 0.600 | 0.563 | 0.600 |
+| N2 "deploy the backend" / "deploy the frontend" | distinct | 0.500 | 0.579 | 0.550 | 0.579 |
+| N3 "review os lecture 1" / "review networks lecture 1" | distinct | 0.586 | 0.586 | 0.586 | 0.586 |
+| N4 "call the bank" / "call ahmed" | distinct | 0.250 | 0.357 | 0.455 | 0.455 |
+| N5 "finish the ai project section" / "start the ai project section" | distinct | 0.647 | 0.759 | 0.815 | **0.815** |
+| P1 "finish ai project section" / "finish the ai project section" | dup | 0.862 | 0.862 | 0.862 | **0.862** |
+| P2 "write unit tests" / "write unit tests for the backend" | dup | 0.531 | 1.000 | 0.531 | 1.000 |
+| P3 "go to the gym" / "gym" | dup | 0.333 | 0.333 | 1.000 | 1.000 |
+| P4 "review chapter 3" / "review chapter 3 before the exam" | dup | 0.515 | 1.000 | 0.515 | 1.000 |
+| A1 "ارد علي احمد" / "ارد علي احمد بخصوص المشروع" | dup | 0.480 | 1.000 | 0.480 | 1.000 |
+| A2 "ارد علي احمد" / "ارد علي خالد" | distinct | 0.471 | 0.667 | 0.615 | 0.667 |
+| A3 "اراجع محاضره os 1" / "…os 2" | distinct (numbers) | 0.800 | 0.889 | 0.889 | 0.889 |
+| A4 "ابدا اتعلم docker" / "اتعلم docker" | dup | 0.765 | 0.765 | 1.000 | 1.000 |
+| A5 "اعمل deploy للباك اند" / "اعمل deploy للفرونت اند" | distinct | 0.630 | 0.667 | 0.630 | 0.667 |
 
-- **Every resolved date is shown explicitly** in the tray, for example "Thu 26 Nov". This catches what ambiguity remains in "الجاي".
-- **Timezone changes:** if the user changes timezone, tasks keep their calendar dates.
-- **DST:** Egypt reinstated DST in 2023. Never hard-code UTC offsets. Always use IANA tzdb.
+**Threshold = 0.84.** The highest score among distinct pairs that don't differ in numbers or dates is 0.815 (N5). The lowest score among true duplicates is 0.862 (P1). The threshold sits between them. Plain `similarity()` at 0.55 would have failed R3, A1, P2, P3, and P4.
 
-### 3.8 Arabic text normalization
+**Known limits:**
+- **Thin margin.** The gap between the two scores is only 0.047.
+- **Containment.** Any title fully contained in another scores 1.0. For example, "gym" vs "cancel gym membership" on the same day would be flagged as a duplicate.
+- **Arabic trigrams depend on the database locale.** They worked in the test image. The P1 acceptance criteria re-run this table on the real managed Postgres.
+- **Growing the fixture.** Every false merge or false split found in daily use is added to the fixture, and the threshold is re-tuned.
 
-Normalization lives in `domain`. It feeds dedupe, evidence matching, and the trigram index.
+### 7.6 Date & timezone handling
+
+- **Storage types:** `scheduled_date` and `deadline_date` are SQL `date` columns, which are local calendar days. `deadline_time` is optional. Instants are `timestamptz` in UTC.
+- **Logical today:** `localNow.time < dayBoundary ? localNow.date − 1 : localNow.date`. The boundary defaults to 04:00, and the rule is kept on purpose.
+
+**Resolver rules:**
+- **`relative_day n`:** logicalToday + n. النهاردة is 0, بكرة is +1, بعد بكرة is +2.
+- **`weekday X nearest/next`** ("الخميس الجاي"): the nearest X strictly after logicalToday. Said on a Thursday, it means the following Thursday.
+- **`weekday X this`:** X in the current week, with weeks starting Saturday. If that day has passed, it becomes a clarification.
+- **`absolute` with no year:** the next occurrence on or after today.
+- **"الأسبوع الجاي" or "آخر الشهر":** `later`, plus a clarification.
+
+**Display rules:**
+- **Every resolved date is shown explicitly.**
+- **Night line:** If the message was sent between 00:00 and the day boundary, every item resolved from a relative expression shows a server-templated line under its date. For example, at 00:45 on Tue 24 Nov: "بكرة = التلات 24 نوفمبر".
+
+**Edge rules:**
+- **Timezone change:** Tasks keep their calendar dates.
+- **Offsets:** UTC offsets are never hard-coded. Egypt reinstated DST in 2023.
+
+### 7.7 Arabic text normalization (`domain`)
 
 - Strip tashkeel and tatweel.
-- Map أ/إ/آ → ا, ى → ي, and ة → ه.
+- Map أ/إ/آ → ا, ى → ي, ة → ه.
 - Convert Arabic-Indic digits to ASCII.
 - Lowercase Latin text and collapse whitespace.
-- Turn "الـ X" into "x", for example "الـ AI" becomes "ai".
-- Extract digit tokens for `numbersMatch`.
+- Turn "الـ X" into "x".
+- Extract digit tokens.
+- Return an **offset map** from normalized positions to original code points, so evidence offsets refer to the original text.
 
-### 3.9 Idempotency & duplicate prevention
-
-There is no generic idempotency table.
+### 7.8 Idempotency, concurrency & duplicate prevention
 
 | Layer | Mechanism |
 |---|---|
-| Audio upload | The client sends an `uploadId`, with UNIQUE (user_id, upload_id). `ON CONFLICT` returns the existing row, or 202 while it is still processing. There is one STT call per upload. |
-| Message send | The client sends a `clientMessageId`, unique per user. A retry returns the stored messages and tray without running a second analysis. |
-| Analysis | UNIQUE (message_id, message_revision). Items are written only when the run succeeds, in the same transaction. |
-| Message edit | A new revision supersedes that message's *pending* items. Applied items are untouched. The new analysis sees them as `T#` and emits updates. |
-| Apply | `UPDATE proposal_items SET status='applied' WHERE id=… AND status='pending'`. `tasks.source_proposal_item_id` is UNIQUE. A retried apply returns the same task IDs. |
-| Manual create | A **client-generated task UUID** is the primary key. `INSERT … ON CONFLICT (id) DO NOTHING` returns the existing row. |
-| Semantic | Number-aware trigram dedupe (§3.5, step 7). |
+| Audio upload | Client `uploadId`, UNIQUE (user_id, upload_id). `ON CONFLICT` returns the existing row, or 202 if it is still processing. |
+| Message send | Client `clientMessageId`, UNIQUE per user. A retry returns the stored messages and tray. There is no second analysis. |
+| Analysis | UNIQUE (message_id, message_revision). Items are written only on success, in the same transaction. |
+| Apply (all-or-nothing) | One transaction (see the steps after this table). |
+| Message edit | Same conversation lock (step 1 below). Supersedes only items still `pending` (revision +1). Items applied by a transaction that won first are untouched. The new analysis sees them as `T#`. |
+| Tray edit (`PATCH`) | Carries the item's `revision`. A stale value returns 409. A successful edit increments the revision. |
+| Manual create | A client-generated task UUID. `INSERT … ON CONFLICT (id) DO NOTHING`. |
+| Semantic | §7.5.1 dedupe plus the re-proposal guard. |
 
-Concurrent edits to the same task are last-write-wins in the MVP. If-Match is V1 hardening.
+**Apply transaction steps:**
+1. `SELECT … FROM conversations WHERE id=$1 FOR UPDATE`. This lock serializes the apply against message edits and other applies.
+2. Load all referenced items.
+3. Check every decision: the item is owned by the user, its status is `pending`, its revision equals the request revision, and the target task is still lifecycle-valid.
+4. If **any** check fails: commit nothing, return 409 with item-level conflicts.
+5. Otherwise, insert or update the tasks, write task_events, mark the items `applied`/`rejected`, insert the templated acknowledgement message, and commit.
 
-### 3.10 Memory model
+**Retry rule:** A retried apply whose items are all already in exactly the requested final states, with matching revisions, returns the stored outcome with 200 (S19). Anything else returns 409.
+
+**Exactly one winner:** Because apply and message edit both take the conversation lock first, one of them always commits first. The other then sees changed statuses or revisions and acts on what is actually there.
+
+Concurrent manual edits to the same task are last-write-wins. If-Match is V1 hardening.
+
+### 7.9 Memory model
 
 | Layer | MVP | Later |
 |---|---|---|
 | Current conversation | Last 10 turns plus the pending tray | Rolling summary (V1) |
-| Task history | Tasks plus task_events | Insights such as "deferred 3×" (V1) |
+| Task history | Tasks plus task_events (field values only) | Insights such as "deferred 3×" (V1) |
 | Preferences | Explicit settings | Learned preferences, confirmed by the user (V1) |
-| Long-term memory | None | V2: opt-in, user-approved facts that can be viewed and deleted. Never taken from emotional content. |
+| Long-term memory | None | V2: opt-in, user-approved facts that can be viewed and deleted |
 
-**Retention:**
-- **Options:** 7 days, 30 days (the default), forever, or "don't keep".
-- **"Don't keep":** a message is purged once all its items are resolved.
-- **Deleting a conversation:** `source_message_id` on its tasks is set to null, and their evidence is removed.
+**Retention (the full MVP privacy scope):**
+- **Retention setting:** 7 d / 30 d (the default) / forever / don't keep.
+- **"Don't keep":** A message is purged once its items are resolved.
+- **Deleting a conversation:** This deletes its messages, analysis runs, proposal items (including their evidence offsets), and transcriptions. It also sets `tasks.source_message_id` and `tasks.evidence_ref` to null.
+- **Orphan transcriptions:** Uploads never attached to a message are purged after 24 h.
+- **"Delete all my data":** This deletes conversations, tasks, and transcriptions.
 
 ---
 
-## 4. Reliability, privacy & security
+## 11. AI reliability, privacy & security
 
 **Reliability:**
-- The §3.5 pipeline.
-- Model and prompt versions are pinned and recorded on every run.
-- Every change passes the eval gate.
-- Degradation is graceful: the user's message is always saved.
-- One retry, plus one repair retry.
+- **Validation:** The §7.5 pipeline, with the model output decoded as a typed union.
+- **Server templates:** All counts, persistence claims, and night date lines.
+- **Versioning:** Model and prompt versions are pinned and recorded per run, and validation reason codes are recorded per op.
+- **Eval gate:** Both splits must pass.
+- **Retries:** 1 retry, plus 1 repair.
 
-**Privacy:**
-- No audio is stored.
-- Users control retention and can delete conversations. Evidence is removed with its conversation.
-- Providers are used only under no-training API terms.
-- Emotional content never becomes memory.
+**Privacy (full MVP scope):**
+- No audio is stored, and no `raw_output` is stored.
+- A retention setting.
+- Deleting a conversation removes its transcriptions, runs, proposal items, and evidence.
+- Task events hold field values only.
+- "Delete all my data".
+- Providers are used under no-training terms.
 
 **Security:**
-- **Session cookie:** HttpOnly, Secure, and SameSite=Lax, on the same origin through Next.js rewrites.
-- **CSRF:** SameSite, plus a custom header required on every mutating request.
-- **Isolation:** every query is scoped per user, and tests cover it.
-- **Uploads:** MIME sniffing, with limits of 25 MB and 5 min.
-- **Secrets:** kept in the host's secret store.
-- **Dependencies:** audited in CI.
-- **Model output:** treated as untrusted data. Its only power is proposing ops against the user's own aliases.
+- **Session:** HttpOnly, Secure, SameSite=Lax cookie on the same origin through Next.js rewrites.
+- **CSRF:** SameSite plus a custom header.
+- **Isolation:** Per-user scoping in every sqlc query, covered by tests.
+- **Uploads:** MIME sniffing, 25 MB and 5 min limits.
+- **Operations:** Secrets in the host secret store. Dependency audit (`govulncheck`, `npm audit`) in CI.
+- **Model output:** Treated as untrusted data. It can only propose ops against the user's own aliases.
 
 **Logging:**
-- Structured JSON, with one correlation ID per turn.
-- Transcripts and task titles are redacted.
-- Latency, token counts, and `cost_usd` live on the `transcriptions` and `analysis_runs` tables. One SQL query gives cost and latency per day.
+- `slog` JSON with one correlation ID per turn.
+- Transcripts and titles are redacted.
+- Cost and latency are queryable from `transcriptions` and `analysis_runs`.

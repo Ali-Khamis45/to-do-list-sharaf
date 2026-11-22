@@ -1,178 +1,181 @@
-# Product Requirements: AI Voice Companion & Intelligent To-Do Manager
+# Product Requirements
 
-Status: Approved for planning (rev 2) · Last updated 2026-11-22
-Related: [architecture-and-ai-pipeline.md](architecture-and-ai-pipeline.md) · [data-and-api.md](data-and-api.md) · [roadmap-and-testing.md](roadmap-and-testing.md) · [decisions.md](decisions.md)
+Status: Planning, rev 3 · Last updated 2026-11-22 · Generated from [plan.md](plan.md); edit plan.md first, then re-split.
+
+Section numbers match `plan.md` (rev 3, the source). Where each section lives: Part A, §1–§4, §10 → product-requirements.md · §5–§7, §11 → architecture-and-ai-pipeline.md · §8–§9 → data-and-api.md · §12–§14, §16 → roadmap-and-testing.md · §15 → decisions.md
 
 ---
 
-## 1. Context
+## Context
 
-- **What:** A voice-first, Egyptian-Arabic-capable companion. You talk through your day at night, and the app turns what you actually committed to into tomorrow's checklist.
-- **Hard rules:** It must not invent tasks. It must not mistake feelings or wishes for commitments.
-- **Real context:** Two users, who are also the two builders. Both are students. Each has about 2 h/day for the project.
-- **Example clock:** All scenario examples assume "now" is **Monday 2026-11-23 22:30, Africa/Cairo** unless stated.
+- **What it does:** It is a voice-first, Egyptian-Arabic-capable companion. You talk through your day at night, and the app turns what you actually committed to into tomorrow's checklist.
+- **Hard rules:** It must not invent tasks, and it must not mistake feelings or wishes for commitments.
+- **Who it's for:** Two users, who are also the two builders. Both of us are students and work on it when we're free, about 2 h/day each on average.
+- **Stage:** This is still planning. No application code, scaffolding, or dependency installs exist yet.
+- **Example clock:** Scenarios assume "now" is **Monday 2026-11-23 22:30, Africa/Cairo** unless stated.
 
-## 2. Analysis
+---
 
-### 2.1 Refined core workflow
+## Part A — Analysis before planning
 
-**Speak → Transcript (editable) → AI reply + Proposed changes → One-tap confirm → Checklist → Check off / revise by talking.**
+### A.1 Refined core workflow
 
-- The AI never writes to the task list directly. It emits **proposed operations**, which land in a **Plan Tray**. The operations are create, update, reschedule, complete, and cancel.
-- Definite tasks are **pre-checked**. Tentative or low-confidence items arrive **unchecked** under "Maybe".
-- Changes to existing tasks are always shown as before → after rows.
-- One tap applies the tray ("Add 4 to Tuesday"). There is no retyping and nothing silent.
-- Opt-in auto-apply is a V1 option once evaluation precision is at least 0.95.
+**Speak → Transcript (editable) → AI reply + suggested changes → One-tap confirm → Checklist → Check off / revise by talking.**
 
-### 2.2 Where we pushed back on the original brief
+- The AI never writes to the task list. It emits **proposed operations**, which land in a **Plan Tray**.
+- **Before apply:** The reply only describes *suggestions*. A server-templated tray summary reads, for example, "اقترحتلك ٤ حاجات، راجعها وأكد".
+- **After apply:** A server-templated acknowledgement is built from what was actually committed.
+- **Pre-checking:** Definite tasks are pre-checked. Tentative and low-confidence items are unchecked under "Maybe". Changes to existing tasks show as before → after rows.
+- **Auto-apply:** An opt-in auto-apply is a V1 option once precision is at least 0.95.
+
+### A.2 Where we pushed back on the brief
 
 | Brief said | Concern | Decision |
 |---|---|---|
-| AI "automatically organizes" tasks | Silent auto-creation with a sometimes-wrong model destroys trust in the list | Pre-checked proposals with one-tap confirm in the MVP. Auto-apply with undo is a V1 opt-in. |
-| 6 primary screens | Today Dashboard and Daily Checklist are the same screen. Tomorrow is the same view on another date. | 3 surfaces: Day view (Today/Tomorrow), Talk, and Settings & Privacy |
-| "Deferred" status | A task moved to Friday is just pending on Friday | Statuses `pending`, `completed`, and `cancelled`. Deferral is an event plus `defer_count`. A null date means "Later". |
-| Heavy Clean Architecture / microservices | Ceremony without payoff at 2 users | A lean modular backend with a pure domain core and thin adapters |
-| Streaming STT, TTS, live voice | Large complexity. A nightly monologue tolerates 3–6 s after "stop". | Batch STT. The local waveform from the mic makes it feel live. Streaming and TTS come in V1/V2. |
-| LLM computes dates | Weekday arithmetic errors around midnight and DST | The LLM emits a **date expression**. A deterministic resolver produces the date. |
-| LLM confidence decides creation | Self-reported confidence is poorly calibrated | A deterministic policy uses commitment class, evidence, reference resolution, and dedupe. Confidence only demotes items to "Maybe". |
+| AI "automatically organizes" tasks | Silent auto-creation with a sometimes-wrong model destroys trust | Suggestions with one-tap confirm. V1 opt-in auto-apply. |
+| 6 primary screens | Today Dashboard and Daily Checklist are the same screen, and Tomorrow is the same view | 3 surfaces: Day view, Talk, Settings & Privacy |
+| "Deferred" status | A task moved to Friday is pending on Friday | `pending` / `completed` / `cancelled`, a `rescheduled` event, `defer_count`, null date = Later |
+| Heavy Clean Architecture / microservices | Ceremony without payoff at 2 users | A lean Go modular monolith with a pure domain package |
+| Streaming STT, TTS, live voice | Large complexity for a nightly monologue | Batch STT and a local waveform. Streaming and TTS in V1/V2. |
+| LLM computes dates | Weekday arithmetic errors at midnight and DST | The LLM emits a date expression, and a deterministic resolver turns it into a date |
+| LLM confidence decides creation | Poorly calibrated | Policy decides. Confidence only demotes an item to Maybe. |
+| LLM reports what it saved | A generative reply can't know a later transaction's result | Suggestion language only. Acknowledgement templated from the apply response. |
 
-### 2.3 Hardest technical challenges, ranked
+### A.3 Hardest technical challenges, ranked
 
-1. **Egyptian Arabic + English code-switching STT.** Models may translate, transliterate ("دوكر"), or drop English terms. They also confuse names such as أحمد and أمجد. This is measured first, in Phase 0.
-2. **Commitment classification.** Telling apart context, task, aspiration, and emotion.
-3. **Reference resolution for edits.** "خليها الجمعة", "قصدي محاضرة 4", and "الغي الجيم" need the right target, including answers to the app's own questions from earlier turns.
-4. **The night-time date boundary.** At 00:45, "بكرة" means the calendar date that has already started.
-5. **Exactly-once creation under retries.**
-6. **Mobile web audio.** iOS Safari MediaRecorder, PWA mic permission, screen lock, and never losing a recording.
+1. **Egyptian Arabic + English code-switching STT.** It can translate, transliterate ("دوكر"), drop terms, or confuse names (أحمد/أمجد).
+2. **Commitment classification.** The model has to tell context, task, aspiration, and emotion apart.
+3. **Reference resolution.** "خليها الجمعة", "قصدي محاضرة 4", "الغي الجيم", and answers to the app's own questions.
+4. **Night-time date boundary.** At 00:45 Tuesday, "بكرة" = Tuesday under the 04:00 rule.
+5. **Exactly-once creation under retries.** It must also hold when an apply races a message edit.
+6. **Mobile web audio.** iOS Safari MediaRecorder, PWA mic permission, and screen lock.
 
-### 2.4 Assumptions (correctable)
+### A.4 Assumptions
 
-1. **Accounts:** Exactly 2 seeded accounts, with no registration in the MVP.
-2. **Capacity:** 2 people × 2 h/day × 6 days/week = **24 team-hours/week** (12 per person). Estimates are ±30%.
-3. **UI language:** English, with full RTL/bidi support for Arabic content. A full Arabic UI is V1 (D-05).
-4. **Task titles:** English by default, with English technical terms preserved. This is a user setting (D-04).
-5. **Replies:** The assistant mirrors the user. Egyptian Arabic in means Egyptian Arabic out.
-6. **Calendar:** The day boundary is 04:00 local. The week starts on Saturday.
+1. **Users:** There are exactly 2 seeded accounts and no registration.
+2. **Capacity:** About 2 h/day each, but we work when we're free. **Hour estimates are the real estimate. Calendar weeks are rough.**
+3. **Language:** The UI is English with full RTL/bidi for Arabic content. Arabic UI is V1 (D-05).
+4. **Task titles:** Titles are **in the language the user spoke**, keeping English technical terms as spoken (D-04). Titles stay editable.
+5. **Replies:** The assistant mirrors the user's language. Egyptian Arabic in means Egyptian Arabic out.
+6. **Days and weeks:** The day boundary is 04:00 local. Weeks start Saturday. We are the users, so there is no external validation of the boundary convention.
 7. **Hosting:** A single cheap host plus managed Postgres, in an EU region (D-08).
 8. **Audio:** Never stored server-side beyond transcription.
 
 ---
 
-## 3. Product vision
+## 1. Product vision
 
 **Vision:** "Talk it out at night, wake up to a plan you trust."
 
-**Positioning:** Capture happens through natural conversation in your own dialect. The AI acts as a **careful secretary**. It writes down only commitments, asks when unsure, and shows the words it relied on.
+**Positioning:** You capture tasks by talking naturally in your own dialect. The AI acts as a **careful secretary**. It suggests only commitments, asks when unsure, and shows the words it relied on.
 
 **Principles:**
-1. **Never invent.** Every AI task cites the user's own words.
-2. **Never silent.** Every change is visible and reversible.
+1. **Never invent.** Every AI suggestion cites the user's own words, located by the server.
+2. **Never silent, never overclaiming.** Every change is visible. The AI never says something was saved unless the server committed it.
 3. **Feelings are heard, not filed.**
 4. **Tomorrow should be doable.** The app warns on overload.
 5. **Private by default.**
 
-**Core KPIs:** nightly sessions per week, tray acceptance rate, edits after apply, and next-day completion rate.
+**Core KPIs:** nightly sessions per week, tray acceptance rate, edits after apply, next-day completion rate.
 
-## 4. Personas & core journeys
+---
+
+## 2. Personas & core journeys
 
 **Personas:**
-- **Primary (real users): the two of us.** CS students in Egypt, juggling lectures, a project, and side learning. We speak Egyptian Arabic with English technical terms and plan at night on a phone.
-- **Future personas.** These inform design only, not MVP scope:
-  - A freelancer or junior developer who captures client follow-ups by text between meetings.
-  - A busy Arabic-first professional who dislikes typing.
+- **Primary (real users), the two of us:** CS students in Egypt with lectures, a project, and side learning. We speak Egyptian Arabic with English technical terms and plan at night on a phone.
+- **Future (informs design only):** A freelancer or junior developer who captures follow-ups by text, and an Arabic-first professional who dislikes typing.
 
 **Journeys:**
-1. **J1 Nightly brain-dump (primary).** Tap the mic, talk for 1–3 min, and see the transcript. The AI reply and tray appear. Answer one follow-up ("Docker?"), then tap "Add 4 to Tuesday".
-2. **J2 Morning check.** The Today view shows progress, and tasks get ticked off.
-3. **J3 Quick capture.** "Remind me to call the bank Thursday" becomes one tray item, then you confirm.
-4. **J4 Revise by talking.** "بكرة مش هعمل Docker، خليها الجمعة" shows a "Tue → Fri" change in the tray, then you confirm.
-5. **J5 Roll over.** Yesterday's unfinished items move to today or Later in one tap, or by saying so.
-6. **J6 Privacy.** In Settings, view and delete conversations. Tasks remain, and their source quotes are removed.
+1. **J1 Nightly brain-dump.** Tap the mic and talk for 1–3 minutes. The transcript appears. The reply comes with a tray showing "اقترحتلك ٤ حاجات، راجعها وأكد". Answer the Docker question, tap apply, and see the ack "تمام، ضفت ٤ حاجات لبكرة".
+2. **J2 Morning check.** The Today view shows progress, and you tick tasks off.
+3. **J3 Quick capture.** "فكرني أكلم البنك الخميس" becomes one suggestion, which you confirm.
+4. **J4 Revise by talking.** "بكرة مش هعمل Docker، خليها الجمعة" shows a "Tue → Fri" change row, which you confirm.
+5. **J5 Roll over.** Yesterday's unfinished tasks move to today or Later.
+6. **J6 Privacy.** Deleting a conversation also deletes its transcriptions and evidence. The tasks remain.
 
-## 5. MVP scope & explicit non-goals
+---
+
+## 3. MVP scope & explicit non-goals
 
 **MVP goal:** Prove that an Egyptian Arabic or code-switched conversation reliably becomes the correct next-day checklist, end to end, on our phones.
 
 **In MVP:**
-- **Accounts:** 2 seeded accounts with password login. Settings cover timezone, day boundary, task language, and daily capacity.
-- **Recording:** Visible recording states, a local waveform, a 5-minute cap, and crash-safe local buffering.
-- **STT:** Batch STT through **one** adapter, for the bake-off winner.
-- **Input:** Text input on par with voice.
-- **Conversation:** History is kept. Editing a sent message re-runs analysis.
-- **Analysis:** **One** LLM adapter producing structured ops: create, update, reschedule, complete, cancel, revise/withdraw proposal, and clarify.
-- **Deterministic core:** A validator, date resolver, number-aware dedupe, and policy.
-- **Plan Tray:** Pre-checked and Maybe items, inline edit, and one-tap apply.
-- **Day view:** Today/Tomorrow with any date reachable. It supports checkbox, undo, edit, reschedule, delete, manual add, a workload bar, and "move unfinished".
-- **Privacy:** A retention setting, view and delete conversations, and "delete all my data".
-- **Evaluation:** An evaluation harness and golden set of 30 text cases and 20 audio clips.
-- **Logging:** Structured logs, plus a per-run record of `cost_usd` and latency.
-- **PWA:** An installable PWA shell that works online only.
+- **Accounts:** 2 seeded accounts with password login. Settings cover timezone, day boundary, task-title language, and daily capacity.
+- **Recording:** Visible states, a local waveform, a 5-minute cap, and crash-safe local buffering.
+- **Input:** Batch STT through **one** adapter (the bake-off winner). Text input is on par with voice.
+- **Conversation:** Full history. Editing a sent message re-runs analysis.
+- **Turn analyzer:** **One** LLM adapter. It returns a reply, a nullable **clarification object**, and typed ops: `create`, `update_task`, `reschedule_task`, `complete_task`, `cancel_task`, `revise_proposal`, `withdraw_proposal`.
+- **Deterministic core:** The validator, evidence locator, date resolver, number-aware dedupe, and policy.
+- **Plan Tray:** A templated summary, pre-checked and Maybe items, inline edit, and **all-or-nothing** one-tap apply with a templated acknowledgement.
+- **Day view:** Today, Tomorrow, or any date. Checkbox, undo, edit, reschedule, delete, manual add, a workload bar, and "move unfinished".
+- **Privacy (full MVP scope):** A retention setting. Deleting a conversation also deletes its transcriptions, runs, and proposal evidence. "Delete all my data". No `raw_output` stored.
+- **Quality and ops:** An evaluation harness with dev and held-out splits. Structured logs, plus per-run `cost_usd` and latency.
+- **Shell:** An installable PWA shell, online only.
 
-**Non-goals for the MVP:**
-- **Voice and AI:** streaming STT, TTS, and long-term memory.
-- **Task features:** subtasks and dependencies, recurrence, reminders and push, calendar integration, and time-blocking.
-- **Platform:** offline editing, sharing, native apps, Arabic UI chrome, and auto-apply.
-- **Infrastructure:** Redis, queues, SignalR, a vector DB, and multi-agent orchestration.
-- **V1 hardening:** everything on the V1 hardening list ([roadmap-and-testing.md §4.1](roadmap-and-testing.md)).
+**Non-goals:** Everything below is out of the MVP.
+- **Voice:** Streaming STT and TTS.
+- **Memory:** Long-term memory.
+- **Task features:** Subtasks, recurrence, reminders, calendar sync, and time-blocking.
+- **Platform:** Offline editing, sharing, native apps, and Arabic UI chrome.
+- **Automation:** Auto-apply.
+- **Infrastructure:** Redis, queues, SignalR, a vector DB, and agents.
+- **Hardening:** Everything on the V1 hardening list (§13.1).
 
-**Anti-goals:**
-- A cluttered dashboard.
-- A chatbot that turns every sentence into a task.
-- A therapist persona.
-- Stored voice recordings.
-
-## 6. Requirements
-
-### 6.1 Functional (MVP)
-
-| ID | Requirement |
-|---|---|
-| FR-01 | Record voice with visible state and elapsed time. Auto-stop at 5 min, with a warning at 4:30. |
-| FR-02 | A recording stays on the device until its transcript is saved on the server. Failed uploads can be retried. |
-| FR-03 | The transcript appears as the user's message. Editing it re-runs analysis and supersedes that message's pending items. |
-| FR-04 | Text input runs the same pipeline as voice. |
-| FR-05 | The reply is in the user's language, with at most one clarifying question per turn. |
-| FR-06 | Definite creates are pre-checked. Tentative items, aspirations with a concrete action, and items with confidence < 0.5 are unchecked "Maybe" items. Low-confidence items also carry a flag. |
-| FR-07 | Every proposal shows its resolved date (for example "Tue 24 Nov") and an expandable evidence quote. |
-| FR-08 | The user can edit title, date, priority, and estimate in the tray, then apply the selected items with one tap. |
-| FR-09 | References to existing tasks yield modify ops, never duplicate creates. |
-| FR-10 | Corrections and answers to clarifying questions revise pending tray items rather than adding new ones. |
-| FR-11 | Number-aware duplicate detection shows "already on your list" and blocks the insert. |
-| FR-12 | The Day view supports checkbox, undo, edit, reschedule, delete, and manual add. |
-| FR-13 | The workload bar compares estimates with daily capacity and warns when over. |
-| FR-14 | "Move unfinished" moves a past day's pending tasks to today or to Later. |
-| FR-15 | Dates resolve in the user's IANA timezone, respecting the day boundary. |
-| FR-16 | Settings cover retention, viewing and deleting conversations, and deleting all data. |
-
-### 6.2 Non-functional
-
-| Area | Target |
-|---|---|
-| Latency | **Stop → tray on a 60 s clip:** p50 ≤ 5 s, p95 ≤ 10 s. **Text → tray:** p50 ≤ 3 s. **Toggle:** ≤ 150 ms, using an optimistic update. |
-| Quality | Meets the gate in [roadmap-and-testing.md §2.2](roadmap-and-testing.md). The gate is directional while the golden set has 30 cases. |
-| Reliability | **Zero duplicate tasks from retries.** This is a hard requirement and is tested. No recording is ever lost silently. |
-| Privacy | **Audio:** never retained. **Transcripts:** kept per the retention setting, 30 days by default, and never written to logs. **Providers:** only under no-training API terms. |
-| Security | **MVP controls:** per-user data isolation (tested), an HttpOnly session cookie, upload limits, and a spend cap. **OWASP ASVS:** a guideline in the MVP and a release gate in V1 hardening. |
-| Accessibility | **MVP:** a labelled mic control, reduced-motion support, and an RTL-correct layout. **WCAG 2.2 AA:** a guideline in the MVP and an audit gate in V1 hardening. |
-| Mobile | Installable PWA on Chrome for Android and iOS Safari 17+. |
-| Cost | **Tracking:** `cost_usd` recorded per analysis and per transcription. **Controls:** a monthly spend alert at the provider and a hard per-user monthly audio-minute cap. |
-| Portability | STT and LLM sit behind ports, and any swap is re-evaluated. |
+**Anti-goals:** A cluttered dashboard. A chatbot that turns every sentence into a task. A therapist persona. Stored voice recordings.
 
 ---
 
-## 7. Screens & UX plan
+## 4. Requirements
 
-### 7.1 Information architecture
+### 4.1 Functional (MVP)
 
-There are three surfaces: the Day view, Talk, and Settings & Privacy.
+| ID | Requirement |
+|---|---|
+| FR-01 | **Recording:** Record voice with visible state and elapsed time. Auto-stop at 5 min, with a warning at 4:30. |
+| FR-02 | **Local buffering:** A recording stays on the device until its transcript is saved. Failed uploads can be retried. |
+| FR-03 | **Editable transcript:** The transcript appears as the user's message. Editing it re-runs analysis and supersedes that message's still-pending items. Apply and edit race safely (FR-18). |
+| FR-04 | **Text input:** Text runs the same pipeline as voice. |
+| FR-05 | **Reply rules:** The reply is in the user's language. **Before apply it describes suggestions only.** It never states counts and never claims anything was saved. It asks at most one clarifying question per turn, through the clarification object. |
+| FR-06 | **Pre-check and Maybe:** Definite creates are pre-checked. Tentative items, concrete aspirations, and confidence < 0.5 go to unchecked "Maybe", with a low-confidence flag where it applies. |
+| FR-07 | **Evidence display:** Every suggestion shows its resolved date and an expandable evidence quote. The **server cuts the quote from the message text using offsets it computed itself**. Between 00:00 and the day boundary, relative-date items show a line such as "بكرة = التلات 24 نوفمبر". |
+| FR-08 | **Tray editing:** Items can be edited in the tray, and each edit bumps the item's revision. Apply is **all-or-nothing**. Any conflict commits nothing and shows item-level conflicts. |
+| FR-09 | **Existing tasks:** References to existing tasks become modify ops, never duplicate creates. |
+| FR-10 | **Corrections:** Corrections and clarification answers revise pending items rather than adding new ones. |
+| FR-11 | **Dedupe:** Number-aware dedupe (§7.5.1) shows "already on your list" and blocks the insert. Re-proposals of rejected or withdrawn items from earlier messages are dropped. |
+| FR-12 | **Day view actions:** Checkbox, undo, edit, reschedule, delete, manual add. |
+| FR-13 | **Workload:** A workload bar compares estimates with daily capacity. |
+| FR-14 | **Move unfinished:** A past day's pending tasks move to today or Later. |
+| FR-15 | **Date resolution:** Dates resolve in the user's IANA timezone with the day boundary. |
+| FR-16 | **Privacy settings:** A retention setting. Deleting a conversation removes its messages, transcriptions, runs, proposal items, and evidence. "Delete all my data". |
+| FR-17 | **Acknowledgement:** After apply, the assistant acknowledgement is a **server template** built from the apply response, never from LLM output. |
+| FR-18 | **Apply vs edit race:** When apply and message-edit act on the same proposal, exactly one wins inside its transaction. The loser gets a 409 or a no-op result. |
+
+### 4.2 Non-functional
+
+| Area | Target |
+|---|---|
+| Latency | Stop on a 60 s clip until the tray shows: p50 ≤ 5 s, p95 ≤ 10 s. Text to tray: p50 ≤ 3 s. Toggle: ≤ 150 ms with an optimistic update. |
+| Quality | The §12.2 gate on **both** the dev and held-out splits. It is directional at this size. |
+| Reliability | Zero duplicate tasks from retries (hard requirement). Zero partial applies. No recording lost silently. |
+| Privacy | No audio retained. No `raw_output`. Transcripts kept per the retention setting, 30 days by default. No transcripts in logs. Providers under no-training API terms. |
+| Security | Per-user isolation, tested. HttpOnly session cookie. Upload limits. A spend cap. ASVS is a guideline in the MVP and a V1-hardening gate. |
+| Accessibility | A labelled mic, reduced motion, RTL-correct layout. WCAG AA is a guideline in the MVP and a V1-hardening gate. |
+| Mobile | Installable PWA on Chrome Android and iOS Safari 17+. |
+| Cost | `cost_usd` per call, a provider spend alert, and a per-user monthly audio-minute cap. |
+| Portability | STT and LLM sit behind interfaces. Re-evaluate on any swap. |
+
+---
+
+## 10. Screens & UX plan
 
 ```
 ┌───────────────────────────────┐
 │  Today ▸ Tomorrow ▸ 📅         │  ← Day view
 │  Mon 23 Nov · 3 of 5 done ███░ │
-│  ☐ Finish AI project section ⓗ │
-│  ☑ Reply to Ahmed              │
-│  ☐ Review OS lecture 1   ~1h   │
+│  ☐ أخلص جزء مشروع الـ AI   ⓗ   │
+│  ☑ أرد على أحمد                │
+│  ☐ أراجع محاضرة 1 OS    ~1h    │
 │  + Add task                    │
 │  ↺ 2 unfinished from yesterday │
 ├───────────────────────────────┤
@@ -180,64 +183,36 @@ There are three surfaces: the Day view, Talk, and Settings & Privacy.
 └───────────────────────────────┘
 ```
 
-- **Day view:** One component, parameterized by date. Before 18:00 the app opens on Today. After 18:00 it opens on Tomorrow, because the evening is planning time.
-- **Talk:** A full-screen sheet opened from the central mic. It holds the conversation, the recorder, and the Plan Tray.
-- **Settings & Privacy:** Profile, task language, day boundary, capacity, retention, the conversations list with delete, and "delete all my data".
-
-### 7.2 Talk screen
-
 ```
 ┌───────────────────────────────┐
 │ ✕  Tonight's check-in          │
 │  You (voice) ✎  "بص أنا…"      │
-│  Companion  "…Docker؟"         │
-│ ┌ Plan for Tue 24 Nov ────────┐│
-│ │☑ Finish AI project section  ││
-│ │☑ Review OS lecture 1  ~1h   ││
-│ │☑ Review OS lecture 2  ~1h   ││
-│ │☑ Reply to Ahmed       ~10m  ││
+│  Companion  "باين يومك كان…"   │
+│ ┌ Tue 24 Nov ─────────────────┐│
+│ │ اقترحتلك ٤ حاجات، راجعها وأكد ││
+│ │☑ أخلص جزء مشروع الـ AI  ~2h ││
+│ │☑ أراجع محاضرة 1 OS     ~1h  ││
+│ │☑ أراجع محاضرة 2 OS     ~1h  ││
+│ │☑ أرد على أحمد بخصوص المشروع ││
 │ │ Maybe                       ││
-│ │☐ Start learning Docker      ││
+│ │☐ أبدأ أتعلم Docker          ││
+│ │ ? Docker: بكرة ولا يوم تاني؟ ││
 │ │ ~4h10m of 6h  ✓ fits        ││
-│ │ [ Add 4 to Tuesday ]        ││
+│ │ [ Confirm 4 ]               ││
 │ └─────────────────────────────┘│
 │   ∿∿∿∿∿  (  ●  )  ⌨            │
 └───────────────────────────────┘
 ```
 
-**Recorder state machine.** Each state has distinct visuals and screen-reader text.
-- **Main flow:** `idle → requesting_permission → recording → stopping → uploading → transcribing → analyzing → reviewing`.
-- **Error states:**
-  - `error_permission`
-  - `error_upload`, where the audio is kept and can be retried
-  - `error_analysis`, which can be retried
-
-**Recording details:**
-- **Input:** Tap to toggle rather than hold-to-talk, because monologues are long.
-- **Feedback:** A waveform driven by the WebAudio AnalyserNode. A Screen Wake Lock is held while recording. Haptic feedback plays on start and stop.
-- **Crash safety:** MediaRecorder writes 1 s chunks to IndexedDB, so a crash never loses audio.
-- **Formats:** `audio/webm;codecs=opus`, falling back to `audio/mp4` for iOS.
-
-**Tray interactions:**
-- **Edit:** Tap a row to edit it inline. The date chip offers Today, Tomorrow, a weekday list, and a picker.
-- **Reject:** Tap ✕ or swipe the row away.
-- **Change rows:** Edits to existing tasks show a before → after diff, such as "Tue → Fri".
-- **Notices:** A duplicate notice row reads "Already on Tuesday". Low-confidence items carry a badge.
-- **Clarification:** Answering the question updates the item in place. For example, the Docker row moves from Maybe into the pre-checked list, with its new date highlighted.
-- **Continuing:** If you keep talking, the tray updates in place and changed fields flash.
-- **Pending banner:** Items not yet applied show as a banner on the Day view: "4 suggestions waiting".
-
-### 7.3 Visual direction
-
-- **Look:** Calm and premium. A warm neutral palette, one accent color, and generous spacing.
-- **Typography:** A type pairing that renders Arabic well, for example IBM Plex Sans Arabic with Inter.
-- **Motion:** Subtle springs for checkbox completion and tray items sliding in. `prefers-reduced-motion` is respected.
-- **Themes:** Dark and light. Dark is likely the default at night.
-- **Text direction:** `dir="auto"` on every user- or AI-generated string. Logical CSS properties are used throughout, so an Arabic UI in V1 is a translation job, not a re-layout.
-
-### 7.4 Frontend structure
-
-- **Routes:** `app/(app)/{day/[date],talk,settings}` and `app/login`.
-- **Features:** `features/recorder` covers the state machine, MediaRecorder adapter, IndexedDB buffer, and waveform. `features/conversation` covers messages and the tray. `features/tasks` covers the Day view, task row, and edit sheet.
-- **API layer:** `lib/api` holds the client generated from `openapi.yaml` and the TanStack Query hooks. Checkbox toggles are optimistic and roll back on error.
-- **Tests:** Vitest with Testing Library for components, and Playwright with fake media streams for E2E.
+- **Day view:** One component, parameterized by date. Before 18:00 it opens on Today, after 18:00 on Tomorrow.
+- **Talk:** A full-screen sheet with three parts.
+  - **Order:** The LLM reply comes first. Under it is the tray card with the templated summary, the items, and the clarification question in its own row.
+  - **Apply:** After apply, the templated acknowledgement appears as an assistant bubble.
+  - **On 409:** The tray re-fetches, highlights the conflicted items, and shows "في حاجة اتغيرت، راجع تاني". Nothing is saved.
+- **Night line:** Between 00:00 and 04:00, relative-date rows show "بكرة = التلات 24 نوفمبر" under the date chip.
+- **Recorder state machine:** `idle → requesting_permission → recording → stopping → uploading → transcribing → analyzing → reviewing`, plus `error_permission`, `error_upload` (audio kept), and `error_analysis` (retry).
+- **Recording:** Tap to toggle. AnalyserNode waveform. Wake Lock. Haptics. 1 s chunks to IndexedDB. webm/opus with an mp4 fallback.
+- **Tray rows:** Inline edit (sends `revision`), reject with ✕ or swipe, before → after change rows, a duplicate notice, a low-confidence badge, and in-place updates as the user keeps talking.
+- **Visuals:** A warm neutral palette with one accent. Arabic-capable type, for example IBM Plex Sans Arabic + Inter. Subtle springs. Reduced-motion support. Dark and light themes.
+- **Text direction:** `dir="auto"` on every generated string, since titles are mostly Arabic with Latin terms. Logical CSS properties throughout.
+- **Code structure:** `web/app/(app)/{day/[date],talk,settings}`, `web/app/login`, `web/features/{recorder,conversation,tasks}`, `web/lib/api`. Tests use Vitest + Testing Library, and Playwright with fake media.

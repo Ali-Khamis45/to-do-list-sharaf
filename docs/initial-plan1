@@ -1,0 +1,892 @@
+# Plan: AI Voice Companion & Intelligent To-Do Manager (Planning Phase)
+
+## Context
+
+- **Why this exists:** The user wants a voice-first, Egyptian-Arabic-capable companion. People talk through their day at night, and the app turns what they actually committed to into tomorrow's checklist. It should not invent tasks, and it should not mistake feelings or wishes for commitments.
+- **Repo state:** `d:\Projects\todolistsharaf` holds only an empty `readme.md`. It is not a git repository. There is no existing code to reuse.
+- **This phase:** Planning only. No application code, scaffolding, or dependency installs.
+- **What happens on approval:** The content below gets split into `/docs` (file map in §17). No code gets written until the user approves the docs and the first milestone.
+- **Dates in examples:** Today is Sunday 2026-11-22. Scenarios assume "now" is **Monday 2026-11-23 22:30, Africa/Cairo** unless stated.
+
+---
+
+## Part A — Analysis before planning
+
+### A.1 Refined core workflow
+
+The original loop is "Speak → understand → extract → organize → check off". It is missing one step that decides whether the product can be trusted: **review**.
+
+**Speak → Transcript (editable) → AI reply + Proposed changes → One-tap confirm → Checklist → Check off / revise by talking.**
+
+- The AI never writes to the task list directly. It produces **proposed operations**, such as create, update, reschedule, complete, or cancel, and they land in a **Plan Tray**.
+- Clear, definite tasks arrive **pre-checked**. Optional or uncertain ones arrive **unchecked**. Destructive changes, such as cancel, reschedule, or edit of an existing task, are always shown explicitly.
+- Confirming is a single tap ("Add 4 to Tuesday"). The user never retypes anything, which meets the brief, and nothing appears silently. In V1, an opt-in auto-apply for high-confidence creates can be added once the evaluation data justifies it.
+
+### A.2 Where I'm pushing back on the brief
+
+| Brief says                                  | Concern                                                                                                                                           | Recommendation                                                                                                                                                                |
+| :------------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------ | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| AI "automatically organizes" tasks          | Silent auto-creation plus a model that is sometimes wrong means users stop trusting the list. That kills a to-do app.                             | Hybrid: pre-checked proposals with one-tap confirm in the MVP. Auto-apply with undo becomes an opt-in V1 feature once precision is at least 0.95 on evaluation.               |
+| 6 primary screens                           | Today Dashboard and Daily Checklist are the same thing. Tomorrow Planner is the same view for another date.                                       | MVP has 3 surfaces: Day view (Today/Tomorrow tabs), Talk, and Settings & Privacy. History comes in V1.                                                                        |
+| "Deferred" as a task status                 | A task moved to Friday is just pending on Friday. A separate status duplicates the date.                                                          | Statuses are `pending`, `completed`, and `cancelled`. Deferral is an event with a counter. A null date means "Later".                                                         |
+| Next.js + ASP.NET Core + Clean Architecture | Two languages and two deployables for a solo MVP. Full Clean Architecture ceremony, such as MediatR and repositories over EF, adds no value here. | Keep both stacks, since it is the user's preference and the cost is modest, but use a **lean 4-project layout**, no MediatR, and same-origin deployment. Full analysis in §5. |
+| Streaming transcription, TTS, live voice    | These add large complexity. A nightly brain-dump is a monologue, so 3–6 s after "stop" is acceptable.                                             | MVP uses batch STT (record → upload → transcript). The local waveform is animated from the mic, so it feels live at no server cost. Streaming and TTS come in V1/V2.          |
+| LLM computes dates                          | LLMs get weekday arithmetic wrong, especially around midnight and DST.                                                                            | The LLM outputs a **date expression** (`relative_day +1`, `weekday thu next`). A deterministic resolver turns it into a date.                                                 |
+| LLM confidence decides creation             | Model self-reported confidence is poorly calibrated.                                                                                              | Deterministic policy rules decide. They use the commitment class, a verbatim evidence quote, reference resolution, and dedupe. Confidence is only one input.                  |
+
+### A.3 Hardest technical challenges, ranked
+
+1. **Egyptian Arabic + English code-switching STT.** Whisper-family models may translate, transliterate ("دوكر"), or drop English terms. Names like أحمد/أمجد get confused. This is the biggest product risk, so it gets measured first in Phase 0.
+2. **Commitment classification.** The system must tell apart context ("عندي امتحان بكرة"), task ("لازم أراجع الفصل التالت"), aspiration ("نفسي أتعلم Docker"), and emotion. Both over-extraction and under-extraction are failures.
+3. **Reference resolution for edits.** "خليها الجمعة", "قصدي محاضرة 4", and "الغي الجيم" must target the right existing task or pending proposal. A wrong target is worse than a missed task.
+4. **The night-time date boundary.** At 00:45, "بكرة" means the calendar date that has already started. A naive implementation is off by one exactly in the app's main usage window.
+5. **Exactly-once task creation.** Uploads, LLM calls, and applies are all retried. The same task must never be inserted twice.
+6. **Mobile web audio.** iOS Safari MediaRecorder quirks, PWA mic permissions, screen lock during long recordings, and never losing a recording.
+
+### A.4 Assumptions (documented, correctable)
+
+1. **Audience:** Individuals, initially Egyptian university students and young professionals. No teams or sharing.
+2. **Launch:** A private beta with 5–20 invited users before any public signup.
+3. **UI language:** The MVP UI is in English, with full RTL/bidi support for Arabic content (`dir="auto"` on user text). A full Arabic UI comes in V1. This is open decision D-05.
+4. **Task title language:** It is a user setting. The default is English titles, following the brief's example, with English technical terms preserved either way. This is open decision D-04.
+5. **Assistant reply language:** It mirrors the user. Egyptian Arabic in gets Egyptian Arabic replies.
+6. **Day boundary:** The default is 04:00 local. Week start defaults to Saturday, which is the Egyptian convention.
+7. **Hosting:** EU region, for example Frankfurt, which gives reasonable latency from Egypt. Managed Postgres.
+8. **Audio:** It is never stored server-side beyond transcription.
+9. **Budget:** A low per-user AI cost is the target. Managed APIs are fine for the beta.
+
+---
+
+## 1. Product vision & refined concept
+
+**Vision:** "Talk it out at night, wake up to a plan you trust."
+
+**What makes it different:** Typing tasks is a chore, and it is the moment most to-do apps get abandoned. Here the capture step is a natural conversation in the user's own dialect. The AI acts as a **careful secretary**, not an eager one. It writes down only what the user committed to, it asks when unsure, and it shows its work through a quote from what the user said.
+
+**Product principles:**
+
+1. **Never invent.** Every AI-created task cites the words that justify it.
+2. **Never silent.** Every change to the list is visible and reversible.
+3. **Feelings are heard, not filed.** Emotional talk gets empathy in the reply and no tasks.
+4. **Tomorrow should be doable.** The app warns when a plan exceeds the user's capacity.
+5. **Private by default.** Minimal retention, everything inspectable and deletable.
+
+**Core loop KPIs:** nightly sessions per week per user, proposal acceptance rate, edits after acceptance, and next-day completion rate.
+
+## 2. Personas & core journeys
+
+**Personas** (pronoun-neutral):
+
+- **P1 – Youssef, CS student, Cairo.** Juggles lectures, a graduation project, and side learning. Speaks Egyptian Arabic with English technical terms. Plans in bed on their phone. Wants something like "talk to a friend who keeps my list."
+- **P2 – Nour, junior developer / freelancer.** Handles client follow-ups, bugs, and deadlines. Switches language mid-sentence. Wants quick capture between meetings, often by text.
+- **P3 – Hana, busy professional and parent.** Mostly Arabic, dislikes typing, and has many small errands. Wants reassurance that nothing is forgotten, without the app feeling like work.
+
+**Core journeys:**
+
+1. **J1 Nightly brain-dump (primary).** Open app → tap mic → talk for 1–3 min → see transcript → AI reply + Plan Tray → answer one follow-up ("Docker?") → tap "Add 4 to Tuesday" → done.
+2. **J2 Morning check.** Open to the Today view → see the list and progress → tick off tasks through the day.
+3. **J3 Quick capture.** Text or voice "remind me to call the bank Thursday" → one item in the tray → confirm.
+4. **J4 Revise by talking.** "بكرة مش هعمل Docker، خليها الجمعة" → tray shows "Move 'Start learning Docker' Tue → Fri" → confirm.
+5. **J5 Roll over.** The next morning the user sees unfinished tasks from yesterday. One tap moves them to today or "Later", or the user says so.
+6. **J6 Privacy.** Settings → see stored conversations → delete one or all → tasks remain, and their source quotes are removed.
+
+## 3. MVP scope & explicit non-goals
+
+**MVP goal:** Prove that an Egyptian Arabic / code-switched conversation reliably becomes the correct next-day checklist, end-to-end, on a phone.
+
+**In MVP:**
+
+- Email/password auth with invite codes, plus user settings: timezone, day boundary, task language, daily capacity.
+- Voice recording with recording states, local waveform, a 5-minute cap, and crash-safe local buffering.
+- Batch STT through a provider abstraction, with one primary provider and one optional fallback.
+- Text input as an equal alternative.
+- A conversation session with history, and editing a sent message, which re-runs analysis.
+- A turn analyzer with structured output producing ops: create, update, reschedule, complete, cancel, revise/withdraw proposal, and clarify.
+- A deterministic validator, date resolver, dedupe, and policy.
+- A Plan Tray with pre-checked and suggested items, inline edits before confirming, and one-tap apply.
+- Day view for Today and Tomorrow, with any date reachable by a picker. It supports checkbox, edit, reschedule, delete, manual add, a workload bar with overload warning, and "move unfinished".
+- Privacy: retention setting, view and delete conversations, delete account, and data export as JSON.
+- An evaluation harness and golden dataset. This is a first-class deliverable, not an afterthought.
+- An installable PWA shell, which works online only.
+
+**Non-goals for MVP:** streaming STT, TTS replies, long-term memory, subtasks and dependencies, recurring tasks, reminders and push, calendar integration, time-blocking, offline editing, teams and sharing, native apps, Arabic UI chrome, analytics dashboards, auto-apply without review, Redis, queues, SignalR, vector DB, and multi-agent orchestration.
+
+**Anti-goals:** a cluttered productivity dashboard, a chatbot that turns every sentence into a task, a therapist persona, or storing raw voice recordings.
+
+## 4. Requirements
+
+### Functional (MVP)
+
+| ID    | Requirement                                                                                                                                              |
+| :---- | :------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| FR-01 | The user can record voice, see recording state and elapsed time, and stop. Recording auto-stops at 5 minutes with a warning at 4:30.                     |
+| FR-02 | A recording is kept on the device until its transcript is saved on the server. Failed uploads can be retried.                                            |
+| FR-03 | The transcript appears as the user's message. It can be edited, and an edit re-runs analysis and supersedes earlier pending proposals from that message. |
+| FR-04 | Text input produces the same pipeline output as voice.                                                                                                   |
+| FR-05 | The assistant replies conversationally in the user's language and asks at most one clarifying question per turn.                                         |
+| FR-06 | Analysis produces proposals. Definite creates are pre-checked, while tentative ones and aspirations are unchecked "Maybe" items.                         |
+| FR-07 | Every AI proposal shows its resolved date (for example "Tue 24 Nov") and an evidence quote, which can be expanded.                                       |
+| FR-08 | The user can edit title, date, priority, and estimate in the tray before applying, then apply selected items with one tap.                               |
+| FR-09 | References to existing tasks produce modify ops such as reschedule, complete, cancel, or update, never duplicate creates.                                |
+| FR-10 | Corrections such as "I meant lecture 4" revise pending tray items rather than adding new ones.                                                           |
+| FR-11 | Duplicate detection warns about "already on your list" and blocks duplicate inserts.                                                                     |
+| FR-12 | Day view lists tasks by priority, with checkbox completion, undo, edit, reschedule, delete, and manual add.                                              |
+| FR-13 | The workload bar compares planned estimates to daily capacity and warns when over capacity.                                                              |
+| FR-14 | "Move unfinished" moves pending tasks from a past day to today or Later.                                                                                 |
+| FR-15 | Dates are resolved in the user's IANA timezone, respecting the day boundary.                                                                             |
+| FR-16 | Settings cover retention, viewing and deleting conversations, deleting everything, exporting data, and deleting the account.                             |
+
+### Non-functional
+
+| Area               | Target                                                                                                                                                                                                |
+| :----------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Latency            | From tapping stop on a 60 s clip to the tray appearing: p50 ≤ 5 s, p95 ≤ 10 s. From text send to tray: p50 ≤ 3 s. Task toggle: ≤ 150 ms with an optimistic update.                                    |
+| Extraction quality | MVP release gate: see §12.2.                                                                                                                                                                          |
+| Reliability        | Zero duplicate tasks from retries. This is a hard requirement covered by tests. No user recording is ever lost silently.                                                                              |
+| Privacy            | No audio retained. Transcripts are kept according to the user's retention setting, 30 days by default. No transcripts in logs. AI providers are used under no-training / limited-retention API terms. |
+| Security           | OWASP ASVS L1 baseline, per-user data isolation tested, rate limits on AI endpoints.                                                                                                                  |
+| Accessibility      | WCAG 2.2 AA, a screen-reader-labelled mic control, reduced-motion support, RTL-correct layout.                                                                                                        |
+| Mobile             | Lighthouse PWA installable, good performance on a mid-range Android phone, iOS Safari 17+ supported.                                                                                                  |
+| Cost               | Track AI cost per session from day one. Set a budget alert. Choose providers in Phase 0 against a per-session cost ceiling.                                                                           |
+| Portability        | STT and LLM providers can be swapped by configuration, and are re-evaluated on every swap.                                                                                                            |
+
+## 5. Technology stack & trade-offs
+
+### 5.1 Backend: ASP.NET Core vs all-TypeScript
+
+|              | Next.js + ASP.NET Core (preferred)                                                                            | Next.js full-stack (TS only)                                       |
+| :----------- | :------------------------------------------------------------------------------------------------------------ | :----------------------------------------------------------------- |
+| Speed to MVP | Slower: two languages, two deployables, type sharing through OpenAPI codegen                                  | Faster: one deploy, shared Zod schemas for API and LLM output      |
+| AI tooling   | Microsoft.Extensions.AI (IChatClient, structured output) is mature, and every provider has a .NET SDK or REST | Vercel AI SDK is excellent for provider-agnostic structured output |
+| Domain rigor | Strong: NodaTime for dates, EF Core migrations, xUnit, Testcontainers                                         | Good: Temporal/date-fns-tz, Drizzle/Prisma                         |
+| Long-term    | Clear backend boundary, good for growth and native apps later                                                 | Can drift into logic spread across Server Actions                  |
+
+**Recommendation: keep Next.js + ASP.NET Core.** It is the stated preference, and the product's core value lies in domain logic: date resolution, the policy engine, and idempotent apply. C#, NodaTime, and EF Core handle that well. The two-stack cost is contained by three rules:
+
+- Next.js is a **thin client**. It has no DB access and no Server Actions with business logic.
+- Both are served **same-origin** behind one reverse proxy (`/` → Next, `/api` → .NET). That removes CORS and keeps cookie auth simple.
+- TypeScript types are **generated from OpenAPI**, never hand-written.
+
+If C# is not a strength, or the MVP deadline is very tight, switch to all-TypeScript. The architecture below maps one-to-one. This is decision D-01.
+
+### 5.2 Final stack (MVP)
+
+| Layer         | Choice                                                                                                                                           | Why / notes                                                                                                                                                          |
+| :------------ | :----------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Frontend      | Next.js (App Router, current stable), TypeScript, Tailwind, shadcn/ui, Motion                                                                    | Preference. Mostly client components for the app. The app shell is static.                                                                                           |
+| Client state  | TanStack Query for server state, plus a small reducer state machine for the recorder                                                             | No global store needed.                                                                                                                                              |
+| API types     | OpenAPI (ASP.NET built-in) → `openapi-typescript` + a fetch client                                                                               | A single source of truth.                                                                                                                                            |
+| PWA           | Web manifest + Serwist service worker (app-shell caching only)                                                                                   | Offline editing is V1.                                                                                                                                               |
+| Backend       | ASP.NET Core on .NET 10 LTS, Minimal APIs                                                                                                        | LTS, minimal ceremony.                                                                                                                                               |
+| Structure     | 4 projects: `Domain`, `Application`, `Infrastructure`, `Api`                                                                                     | The pure Domain holds date resolution, policy, normalization, and lifecycle, all unit-testable. No MediatR. Application services use an `IAppDbContext` abstraction. |
+| Dates         | NodaTime + IANA tzdb                                                                                                                             | Egypt reinstated DST in 2023, so offsets must never be hard-coded.                                                                                                   |
+| DB            | PostgreSQL 17 (managed), EF Core + Npgsql, `pg_trgm` extension                                                                                   | Trigram similarity for dedupe. `xmin` as the concurrency token.                                                                                                      |
+| Auth          | ASP.NET Core Identity, cookie auth, invite codes                                                                                                 | Same-origin cookie, SameSite=Lax, antiforgery header on mutations. Google sign-in in V1.                                                                             |
+| AI ports      | `ITranscriber`, `ITurnAnalyzer` (own interfaces). Adapters may use Microsoft.Extensions.AI internally                                            | Swappable providers, mockable in tests.                                                                                                                              |
+| Real-time     | None in MVP. A 2-step HTTP flow (transcribe → analyze) gives progressive UI                                                                      | SSE for streaming reply text in V1. SignalR only if duplex voice arrives (V2).                                                                                       |
+| Rate limiting | ASP.NET Core built-in rate limiter (in-memory)                                                                                                   | Single instance is enough, so Redis is not needed.                                                                                                                   |
+| Observability | OpenTelemetry (traces + metrics), Serilog JSON logs with redaction                                                                               | Export to any OTLP backend, such as Grafana Cloud free tier.                                                                                                         |
+| Local dev     | Docker Compose (Postgres + optional API container)                                                                                               | Docker only where it earns its place.                                                                                                                                |
+| Hosting       | One container host (for example Azure Container Apps, Fly.io, or Railway) running Next + API behind Caddy, plus managed Postgres in an EU region | Decision D-08.                                                                                                                                                       |
+
+**Explicitly not used, with reasons:** Redis has no cross-instance state in the MVP. Queues are unnecessary because the pipeline is synchronous and under 10 s. A vector DB is unnecessary because the task context is small and trigram search covers "find similar task". Microservices bring operational cost with no benefit at this scale. Agent orchestration is not needed because one structured call plus deterministic code is more reliable.
+
+### 5.3 Speech-to-text options
+
+| Option                                                | Arabic / Egyptian / code-switching                                          | Latency        | Privacy                                                          | Ops                              | Verdict                                       |
+| :---------------------------------------------------- | :-------------------------------------------------------------------------- | :------------- | :--------------------------------------------------------------- | :------------------------------- | :-------------------------------------------- |
+| OpenAI `gpt-4o-transcribe` / `gpt-4o-mini-transcribe` | Strong multilingual. Accepts a text prompt for vocabulary biasing.          | Low–medium     | API data not used for training. Retention terms must be checked. | None                             | **Bake-off candidate**                        |
+| Groq-hosted Whisper large-v3 / turbo                  | Whisper-level Arabic. Code-switch quality varies. Prompt biasing supported. | Very low       | Check terms                                                      | None                             | **Bake-off candidate.** Cheapest and fastest. |
+| ElevenLabs Scribe                                     | Reported strong on Arabic dialects                                          | Medium         | Check terms                                                      | None                             | **Bake-off candidate**                        |
+| Google Chirp (Cloud STT)                              | Has an `ar-EG` locale                                                       | Medium         | Enterprise terms, region choice                                  | Low                              | Optional candidate                            |
+| Azure AI Speech                                       | `ar-EG` locale, phrase lists. Weaker on mid-sentence English.               | Low            | Enterprise terms, region choice                                  | Low                              | Fallback candidate                            |
+| Self-hosted faster-whisper (GPU)                      | Same as Whisper. Egyptian fine-tunes exist on Hugging Face.                 | Depends on GPU | Best, since data stays in-house                                  | High: GPU cost, scaling, updates | **V2** if privacy or cost demands it          |
+
+**Decision method (Phase 0):** Record about 40 real clips from 4–6 speakers, covering quiet rooms, bed or low voice, and street noise. Score each provider on:
+
+- WER/CER (word and character error rates)
+- **Entity accuracy**: names, English technical terms, numbers like "محاضرة 4"
+- **Downstream task F1**: run the same analyzer on each provider's transcripts
+- p95 latency and cost per minute
+
+Pick by downstream task F1 first. Bias every STT call with a short prompt listing the user's open task titles and names. That cheaply improves name and term recognition.
+
+### 5.4 LLM
+
+The choice is provider-agnostic. Candidates come from the current frontier "fast" tiers of at least two vendors. Requirements:
+
+- native strict JSON-schema structured output
+- strong Egyptian Arabic understanding
+- prompt caching
+- no-training API terms
+
+The model is chosen by the evaluation harness in Phase 0/1, not by reputation. Model IDs are pinned in config, and any change of model or prompt requires a passing evaluation run.
+
+## 6. High-level architecture
+
+```mermaid
+flowchart LR
+  subgraph Client["Phone browser / PWA (Next.js)"]
+    Mic[Recorder + waveform\nMediaRecorder + WebAudio]
+    IDB[(IndexedDB\npending audio)]
+    UI[Day view · Talk · Plan Tray · Settings]
+  end
+  subgraph Edge["Caddy reverse proxy (same origin)"]
+  end
+  subgraph API["ASP.NET Core API (.NET 10)"]
+    EP[Minimal API endpoints\nauth · rate limit · idempotency]
+    APP[Application services\nTranscribe · AnalyzeTurn · ApplyProposals · Tasks]
+    DOM[Domain\nDateResolver · Policy · Normalizer · Lifecycle]
+    PORTS[Ports: ITranscriber · ITurnAnalyzer · IClock]
+  end
+  STT[(STT provider\nprimary + fallback)]
+  LLM[(LLM provider\nprimary + fallback)]
+  PG[(PostgreSQL\n+ pg_trgm)]
+  OTEL[(OTLP backend\ntraces/metrics/logs)]
+
+  Mic --> IDB --> Edge
+  UI --> Edge --> EP --> APP
+  APP --> DOM
+  APP --> PORTS
+  PORTS --> STT
+  PORTS --> LLM
+  APP --> PG
+  API -. telemetry .-> OTEL
+
+```
+
+**Primary voice turn (sequence):**
+
+```mermaid
+sequenceDiagram
+  actor U as User
+  participant C as Client
+  participant A as API
+  participant S as STT
+  participant L as LLM
+  participant D as Postgres
+  U->>C: tap mic, talk, tap stop
+  C->>C: save blob to IndexedDB (uploadId)
+  C->>A: POST /transcriptions (audio, Idempotency-Key=uploadId)
+  A->>D: upsert transcription(uploadId) status=processing
+  A->>S: transcribe(audio, vocab prompt)
+  S-->>A: text
+  A->>D: transcription status=done (audio discarded)
+  A-->>C: {transcriptionId, text}
+  C->>C: show transcript bubble, delete blob
+  C->>A: POST /conversations/{id}/messages (clientMessageId, transcriptionId)
+  A->>D: insert message (unique clientMessageId)
+  A->>D: load context (tasks ±14d, pending tray, last turns, settings)
+  A->>L: analyze(context, transcript) → strict JSON
+  L-->>A: {reply, operations[], clarification}
+  A->>A: validate → resolve refs → resolve dates → dedupe → policy
+  A->>D: tx: analysis_run + proposal_items + assistant message
+  A-->>C: {assistantMessage, tray, workload}
+  U->>C: review, tap "Add 4 to Tuesday"
+  C->>A: POST /proposal-items/apply (Idempotency-Key)
+  A->>D: tx: tasks + task_events, items→applied (guarded)
+  A-->>C: applied task ids
+
+```
+
+**Why two HTTP calls instead of one:** The transcript appears after about 1–3 s, which gives progress feedback and a chance to correct it, with no WebSocket needed. Each step is also independently retryable and idempotent.
+
+## 7. AI conversation & task extraction architecture
+
+### 7.1 Design stance
+
+One **structured "turn analysis" call** per user message returns the reply and the operations together. Deterministic code then decides what reaches the user. The model proposes, and the code disposes.
+
+A single call is cheaper and faster, and keeps the reply consistent with the proposals ("I added 4 tasks…"). If evaluation shows reply generation degrading extraction, split it into two calls: extraction, then reply. The ports allow that without API changes.
+
+### 7.2 Context sent to the model (built server-side)
+
+- **System prompt:** a versioned file in the repo (for example `prompts/turn-analyzer/v3.md`). It contains the role, classification rules, op semantics, splitting rules, the language policy for titles and replies, 6–10 few-shot examples, and the JSON schema. Few-shot examples must never overlap the evaluation set.
+- **Clock block:** user timezone, local now, logical today and tomorrow after the day boundary, with weekday names in Arabic and English, plus week start.
+- **Task context:** open tasks from logical today −1 to +14 days, plus Later tasks. They are matched by trigram against the transcript when there are more than 40. Each gets a **short alias** `T1..Tn` with title, date, status, and priority. The model never sees UUIDs, so it cannot hallucinate IDs.
+- **Pending tray:** `P1..Pn` with current fields.
+- **Conversation:** the last 10 turns of the current session. Older turns are dropped in the MVP. A rolling summary comes in V1.
+- **User message:** the current message text, marked as voice or text.
+
+### 7.3 Output schema (strict JSON schema; illustrative)
+
+```json
+{
+  "reply": "string (user's language, ≤ 600 chars)",
+  "clarification": { "question": "string", "about_ops": ["op1"] } ,
+  "operations": [
+    {
+      "op_id": "op1",
+      "type": "create | update_task | reschedule_task | complete_task | cancel_task | revise_proposal | withdraw_proposal",
+      "target": "T3 | P2 | null",
+      "title": "string | null",
+      "description": "string | null",
+      "date": { "kind": "none | relative_day | weekday | absolute | later | unresolved",
+                "offset": 1, "weekday": "thu", "which": "this | next | nearest",
+                "year": null, "month": null, "day": null, "text": "الخميس الجاي" },
+      "deadline": { "...same DateExpr shape..." : null },
+      "priority": "high | medium | low | null",
+      "estimate_minutes": 90,
+      "estimate_source": "stated | inferred | null",
+      "commitment": "definite | tentative | aspiration",
+      "evidence": "verbatim span from the CURRENT user message",
+      "duplicate_of": "T5 | P1 | null",
+      "confidence": 0.0
+    }
+  ]
+}
+
+```
+
+`clarification` is nullable. Arrays may be empty. A turn of pure venting returns `operations: []`.
+
+### 7.4 Classification rules (in prompt, verified by evaluation)
+
+- **Context** ("عندي امتحان بكرة") → no op. The reply may offer help ("تحب أحطلك مراجعة؟").
+- **Commitment with an action** ("لازم / المفروض / هعمل / محتاج أ…") → `create` with commitment `definite`.
+- **Tentative** ("ممكن / لو لقيت وقت / بفكر") → `create` with commitment `tentative`, which policy turns into an unchecked "Maybe" item.
+- **Aspiration** ("نفسي / كان نفسي / عايز في يوم") → `create` with commitment `aspiration`, shown as a "Maybe" item only if it has a concrete action. Otherwise it becomes a reply mention only.
+- **Emotion** → never an op. It goes into the reply's tone.
+- **Negation plus a new date** ("مش هعمل X بكرة، خليها الجمعة") → `reschedule_task`, never `cancel` + `create`.
+- **Negation alone** ("مش هعمل X خلاص") → `cancel_task`.
+- **Past completion** ("خلصت / عملت") → `complete_task`.
+- **Correction** ("لا قصدي…") → `revise_proposal` if the target is a pending item, or `update_task` if it was already applied.
+- **Enumerable counts** ("محاضرتين", "تلات محاضرات") → split into N creates when N ≤ 5 and the items are naturally separate. Otherwise create one task with the count in the title.
+- **Estimates** → `stated` only when the user said a duration. `inferred` estimates are allowed but displayed with "\~" in muted style.
+
+### 7.5 Deterministic validation pipeline (server)
+
+1. **Schema validation** against the same JSON schema, via provider strict mode plus server-side re-validation.
+2. **Reference resolution:** map `T#`/`P#` to real IDs. Unknown alias → drop the op and log. Ambiguous intent → convert to a clarification.
+3. **Evidence check:** normalize both sides (§7.7). The evidence must fuzzy-match a span of the current message with similarity ≥ 0.8. Failure means the op is dropped. This is the main guard against invented tasks.
+4. **Date resolution** (§7.6). A past date becomes a clarification. More than 365 days out gets flagged. `unresolved` becomes a clarification and the item goes to Later.
+5. **Field sanity:** title 2–120 chars, estimate 5–600 min, enums valid.
+6. **Lifecycle rules:** cannot complete a cancelled task, cannot reschedule a completed one, a create targeting a task is invalid, and so on.
+7. **Dedupe:** a `create` is compared to open tasks and pending items. It is a duplicate if trigram similarity ≥ 0.55 on the normalized title, the date is within ±1 day, or the model set `duplicate_of`. Duplicates become a "Already on your list: …" notice, never an insert.
+8. **Policy:** assign `preselected`, `maybe`, or `needs_confirmation` (table below).
+9. **Persist atomically:** the analysis run, proposal items, and assistant message go in one transaction.
+
+| Op                                      | Condition                                                 | Tray presentation                                                                                                    |
+| :-------------------------------------- | :-------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------- |
+| create                                  | definite + valid evidence + date resolved + not duplicate | Pre-checked                                                                                                          |
+| create                                  | tentative / aspiration                                    | "Maybe" section, unchecked                                                                                           |
+| create                                  | confidence < 0.5                                          | Dropped, logged for evaluation                                                                                       |
+| reschedule / update / cancel / complete | target resolved uniquely                                  | Shown as a change row ("Tue → Fri"), pre-checked, needs the apply tap                                                |
+| any modify                              | target ambiguous                                          | No item. The clarification question is asked instead.                                                                |
+| revise / withdraw proposal              | target is pending                                         | Applied directly to the tray item, with change highlighted. This is safe because nothing is persisted as a task yet. |
+
+**Failure handling:**
+
+- LLM timeout or 5xx → 1 retry with backoff, then the fallback provider.
+- Schema-invalid output → 1 repair retry with the validation errors attached.
+- Total failure → the message is still saved, the assistant says "I saved what you said but couldn't organize it. Retry?", and the run is marked `failed` for manual retry.
+- Hard timeout budget is 20 s for the analysis step.
+
+### 7.6 Date & timezone handling
+
+- **Stored types:** `scheduled_date` and `deadline_date` are Postgres `date` values, as local calendar days. `deadline_time` is optional `time`. Instants (`created_at` etc.) are `timestamptz` in UTC.
+- **Logical today:** `localNow.Time < dayBoundary (04:00) ? localNow.Date − 1 : localNow.Date`.
+- **Resolver rules** (pure function in Domain, table-tested):
+  - `relative_day n` → logicalToday + n. This covers النهاردة 0, بكرة +1, بعد بكرة +2.
+  - `weekday X which=nearest/next` ("الخميس الجاي", "يوم الخميس") → the nearest X strictly after logicalToday. Said on Thursday, it gives next week's Thursday.
+  - `weekday X which=this` ("الخميس ده") → the X in the current week (Saturday start). If it has already passed, it becomes a clarification.
+  - `absolute` without a year → the next occurrence on or after today.
+  - "الأسبوع الجاي" or "آخر الشهر" → `later` plus a clarification, in the MVP.
+- **Every resolved date is shown explicitly** in the tray (for example "Thu 26 Nov"). That is the human safety net for the residual ambiguity in "الجاي".
+- If the user changes timezone, tasks keep their calendar dates. That is the intended behavior.
+
+### 7.7 Arabic text normalization (Domain)
+
+Normalization feeds dedupe, evidence matching, and the trigram index:
+
+- Strip tashkeel and tatweel.
+- Unify أ/إ/آ → ا, ى → ي, and ة → ه.
+- Convert Arabic-Indic digits to ASCII.
+- Lowercase Latin text and collapse whitespace.
+- Strip the "الـ" prefix before Latin words ("الـ AI" → "ai").
+
+### 7.8 Idempotency & duplicate prevention (end to end)
+
+| Layer         | Mechanism                                                                                                                                                                                          |
+| :------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Audio upload  | The client generates `uploadId`, sent as the Idempotency-Key. `transcriptions` has a unique (user_id, upload_id) constraint. A retry returns the existing result, or waits while it is processing. |
+| Message send  | `clientMessageId` is unique per user. A retry returns the stored user message, assistant message, and tray. It does not run a second analysis.                                                     |
+| Analysis      | Unique (message_id, message_revision). LLM retries happen inside one run. Proposal items are only written when the run succeeds, in the same transaction.                                          |
+| Message edit  | A new revision supersedes that message's still-pending items. Already-applied items are not touched. The new analysis sees them as `T#` and emits updates instead.                                 |
+| Apply         | Each item transitions `pending → applied` via `UPDATE … WHERE status='pending'`. `tasks.source_proposal_item_id` is UNIQUE. A retried apply returns the same task IDs.                             |
+| Semantic      | Trigram dedupe (§7.5 step 7) catches "the same task said twice in different words."                                                                                                                |
+| Manual create | `Idempotency-Key` header, stored in `idempotency_keys` (user, key, request hash, response, 24 h TTL).                                                                                              |
+
+### 7.9 Memory model
+
+| Layer                           | MVP                                                            | Later                                                                                                                                    |
+| :------------------------------ | :------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. Current conversation context | The last 10 turns plus the pending tray, assembled per request | Rolling session summary (V1)                                                                                                             |
+| 2. Persisted task history       | Tasks plus task_events. This is the main "memory."             | Pattern insights, such as "you've deferred this 3×" (V1)                                                                                 |
+| 3. Explicit preferences         | Settings: language, capacity, day boundary                     | Preferences learned only when confirmed ("Always make lectures 1h?") (V1)                                                                |
+| 4. Long-term memory             | None                                                           | V2: user-approved facts ("Ahmed = project partner"), each one visible and deletable in Settings, never auto-saved from emotional content |
+
+Conversation transcripts follow the retention setting: 7 days, 30 days (default), forever, or "don't keep." With "don't keep", a message is purged after its proposals are resolved. Tasks persist independently. Deleting a conversation sets the tasks' `source_message_id` to null and removes evidence quotes.
+
+## 8. PostgreSQL database design
+
+```mermaid
+erDiagram
+  users ||--o{ conversations : has
+  users ||--o{ tasks : owns
+  users ||--o{ transcriptions : uploads
+  conversations ||--o{ messages : contains
+  transcriptions |o--o| messages : "becomes"
+  messages ||--o{ analysis_runs : "analyzed by"
+  analysis_runs ||--o{ proposal_items : produces
+  proposal_items |o--o| tasks : "creates / targets"
+  tasks ||--o{ task_events : history
+  messages |o--o{ tasks : "source of"
+
+```
+
+| Table                       | Key columns                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Constraints / indexes                                               |
+| :-------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------ |
+| `users` (+ Identity tables) | id uuid, email, display_name, timezone (IANA), day_boundary time = 04:00, week_start = sat, task_language (en\|ar\|match), reply_language (match), daily_capacity_minutes = 360, transcript_retention (7d\|30d\|forever\|none), created_at                                                                                                                                                                                                                                                      | unique email                                                        |
+| `invite_codes`              | code, used_by_user_id, expires_at                                                                                                                                                                                                                                                                                                                                                                                                                                                               | unique code                                                         |
+| `conversations`             | id, user_id, title null, started_at, last_message_at, deleted_at null                                                                                                                                                                                                                                                                                                                                                                                                                           | idx (user_id, last_message_at desc)                                 |
+| `transcriptions`            | id, user_id, upload_id uuid, status (processing\|done\|failed), text, detected_language, duration_ms, provider, model, latency_ms, error_code, created_at                                                                                                                                                                                                                                                                                                                                       | **unique (user_id, upload_id)**                                     |
+| `messages`                  | id, conversation_id, user_id, role (user\|assistant), text, input_mode (voice\|text), transcription_id null, client_message_id null, revision int = 1, edited_at, created_at                                                                                                                                                                                                                                                                                                                    | **unique (user_id, client_message_id)**                             |
+| `analysis_runs`             | id, message_id, message_revision, status (succeeded\|failed\|partial), provider, model, prompt_version, raw_output jsonb (purged with the message), validation_report jsonb, attempts, tokens_in, tokens_out, latency_ms, cost_usd numeric, created_at                                                                                                                                                                                                                                          | **unique (message_id, message_revision)**                           |
+| `proposal_items`            | id, conversation_id, analysis_run_id, op_type, target_task_id null, payload jsonb (title, dates, priority, estimate…), resolved_scheduled_date, commitment, presentation (preselected\|maybe\|change), evidence, confidence, duplicate_of_task_id, status (pending\|applied\|rejected\|superseded\|withdrawn), revision, decided_at, applied_task_id                                                                                                                                            | idx (conversation_id, status)                                       |
+| `tasks`                     | id, user_id, title, title_normalized, description, scheduled_date date null (null = Later), status (pending\|completed\|cancelled), priority (high\|medium\|low), estimate_minutes, estimate_source (stated\|inferred\|manual), deadline_date, deadline_time, sort_order, source (manual\|ai), source_message_id null (on delete set null), **source_proposal_item_id unique null**, evidence null, defer_count int = 0, completed_at, cancelled_at, created_at, updated_at, xmin (concurrency) | idx (user_id, scheduled_date, status); GIN trgm on title_normalized |
+| `task_events`               | id, task_id, user_id, type (created\|updated\|rescheduled\|completed\|reopened\|cancelled\|deleted), actor (user\|ai_confirmed), proposal_item_id null, before jsonb, after jsonb, created_at                                                                                                                                                                                                                                                                                                   | idx (task_id, created_at)                                           |
+| `idempotency_keys`          | user_id, key, request_hash, response_status, response_body jsonb, created_at                                                                                                                                                                                                                                                                                                                                                                                                                    | pk (user_id, key); purged after 24 h                                |
+
+**Deferred to later versions:**
+
+- V1: `task_dependencies` (task_id, depends_on_task_id) and `parent_task_id` for breakdown.
+- V2: `user_memories` (id, user_id, content, source_message_id, created_at).
+
+**Data rules:**
+
+- Every query is scoped by `user_id`. A global EF query filter is applied, and integration tests cover isolation.
+- Task delete is a hard delete, keeping a `deleted` event without content.
+- Account deletion cascades everything.
+- A daily job inside the API purges expired transcripts, run outputs, and idempotency keys. It uses an `IHostedService` with a Postgres advisory lock, so no queue is needed.
+
+## 9. Backend API contract (REST, `/api/v1`)
+
+**Conventions:**
+
+- JSON in camelCase. Errors use RFC 9457 Problem Details with a `code` field.
+- `Idempotency-Key` is required on POSTs that create things.
+- `If-Match: <version>` is used on task PATCH, returning 409 on conflict.
+- Dates are ISO `YYYY-MM-DD` and instants are ISO UTC.
+
+| Method & path                                                                             | Purpose                                                                                                            |
+| :---------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------- |
+| `POST /auth/register` {email, password, inviteCode, timezone}                             | Register                                                                                                           |
+| `POST /auth/login`, `POST /auth/logout`                                                   | Cookie session                                                                                                     |
+| `GET /me`, `PATCH /me/settings`                                                           | Profile and settings                                                                                               |
+| `GET /me/export`, `DELETE /me`                                                            | Export as JSON, delete account                                                                                     |
+| `POST /transcriptions` multipart {audio, uploadId}                                        | STT. Returns `{id, status, text, durationMs, language}`                                                            |
+| `POST /conversations`                                                                     | Start a session. The client starts a new one if the last message is more than 6 h old.                             |
+| `GET /conversations?cursor=`, `GET /conversations/{id}`                                   | List, and detail including messages and pending tray                                                               |
+| `DELETE /conversations/{id}`, `DELETE /conversations`                                     | Delete one or all                                                                                                  |
+| `POST /conversations/{id}/messages` {clientMessageId, text?, transcriptionId?, inputMode} | Send a turn and get the reply and tray                                                                             |
+| `PUT /messages/{id}` {text}                                                               | Edit, re-analyze, return the new tray                                                                              |
+| `POST /messages/{id}/retry-analysis`                                                      | Re-run a failed analysis                                                                                           |
+| `PATCH /proposal-items/{id}` {title?, scheduledDate?, priority?, estimateMinutes?}        | Edit an item before applying                                                                                       |
+| `POST /proposal-items/apply` {itemIds[], rejectItemIds[]}                                 | Apply atomically. Returns `{applied:[{itemId, taskId, op}], skipped:[{itemId, reason}]}`                           |
+| `GET /days/{date}`                                                                        | Tasks for the day, plus workload `{plannedMinutes, capacityMinutes, status}` and a carry-over count from yesterday |
+| `GET /tasks?from&to&status&later=true`                                                    | Range query                                                                                                        |
+| `POST /tasks` {title, scheduledDate?, priority?, estimateMinutes?, deadlineDate?}         | Manual create                                                                                                      |
+| `PATCH /tasks/{id}`                                                                       | Edit fields                                                                                                        |
+| `POST /tasks/{id}/complete`, `/reopen`, `/cancel`, `/reschedule` {toDate \| null}         | Lifecycle actions, each idempotent on state                                                                        |
+| `DELETE /tasks/{id}`                                                                      | Delete                                                                                                             |
+| `POST /tasks/move-unfinished` {fromDate, toDate \| null}                                  | Batch roll-over                                                                                                    |
+
+**Example response for `POST /conversations/{id}/messages`:**
+
+```json
+{
+  "userMessage": { "id": "m_1", "text": "بص أنا النهاردة مخلصتش…", "revision": 1, "inputMode": "voice" },
+  "assistantMessage": { "id": "m_2", "text": "باين يومك كان تقيل، ولا يهمك. حطيتلك ٤ حاجات لبكرة. وموضوع Docker، تحب نحطه بكرة ولا يوم تاني الأسبوع ده؟" },
+  "analysis": { "runId": "r_1", "status": "succeeded" },
+  "tray": {
+    "items": [
+      { "id": "p_1", "op": "create", "presentation": "preselected", "title": "Finish the AI project section",
+        "scheduledDate": "2026-11-24", "priority": "high", "estimateMinutes": 120, "estimateSource": "inferred",
+        "evidence": "عندي جزء في مشروع الـ AI لازم أخلصه بكرة", "duplicateOf": null },
+      { "id": "p_5", "op": "create", "presentation": "maybe", "title": "Start learning Docker",
+        "scheduledDate": null, "commitment": "tentative", "evidence": "كنت عايز أبدأ أتعلم Docker بس مش عارف هلاقي وقت" }
+    ],
+    "clarification": { "question": "Docker: بكرة ولا يوم تاني؟", "itemIds": ["p_5"] },
+    "workload": { "date": "2026-11-24", "plannedMinutes": 250, "capacityMinutes": 360, "status": "ok" }
+  }
+}
+
+```
+
+**Error codes:** `stt_failed`, `stt_audio_too_long`, `analysis_failed`, `rate_limited`, `version_conflict`, `item_not_pending`, `validation_failed`, `not_found`.
+
+**Rate limits (per user):** 30 transcriptions/hour, 60 messages/hour, 300 audio-minutes/month in the beta.
+
+## 10. Frontend screen architecture & UX plan
+
+### 10.1 Information architecture (MVP)
+
+```
+┌───────────────────────────────┐
+│  Today ▸ Tomorrow ▸ 📅         │  ← Day view, segmented header
+│  Mon 23 Nov · 3 of 5 done ███░ │
+│  ☐ Finish AI project section ⓗ │
+│  ☑ Reply to Ahmed              │
+│  ☐ Review OS lecture 1   ~1h   │
+│  + Add task                    │
+│  ↺ 2 unfinished from yesterday │
+├───────────────────────────────┤
+│   Today      ( 🎙 )     ⚙      │  ← bottom bar, central mic opens Talk
+└───────────────────────────────┘
+
+```
+
+- **Day view:** One component, parameterized by date. Today is the default before 18:00. After 18:00, the app opens on Tomorrow, because the evening is planning time.
+- **Talk:** A full-screen sheet opened from the central mic. It holds the conversation, the recorder, and the Plan Tray.
+- **Settings & Privacy:** profile, language, day boundary, capacity, retention, conversations list with delete, export, delete account.
+
+### 10.2 Talk screen
+
+```
+┌───────────────────────────────┐
+│ ✕  Tonight's check-in          │
+│  You (voice) ✎                 │
+│  "بص أنا النهاردة مخلصتش…"     │
+│  Companion                     │
+│  "باين يومك كان تقيل… Docker؟" │
+│ ┌ Plan for Tue 24 Nov ────────┐│
+│ │☑ Finish AI project section  ││
+│ │   High · ~2h       “…لازم…”  ││
+│ │☑ Review OS lecture 1  ~1h   ││
+│ │☑ Review OS lecture 2  ~1h   ││
+│ │☑ Reply to Ahmed       ~10m  ││
+│ │ Maybe                       ││
+│ │☐ Start learning Docker      ││
+│ │ ~4h10m of 6h  ✓ fits        ││
+│ │ [ Add 4 to Tuesday ]        ││
+│ └─────────────────────────────┘│
+│   ∿∿∿∿∿  (  ●  )  ⌨            │
+└───────────────────────────────┘
+
+```
+
+**Recorder states** (an explicit state machine, each with distinct visuals and screen-reader text): `idle → requesting_permission → recording → stopping → uploading → transcribing → analyzing → reviewing`, plus `error_permission`, `error_upload (retry kept)`, and `error_analysis (retry)`.
+
+**Recording details:**
+
+- Tap to toggle, not hold-to-talk, because monologues are long.
+- The waveform comes from the WebAudio AnalyserNode.
+- Screen Wake Lock is held during recording, and there is haptic feedback on start and stop.
+- MediaRecorder writes 1 s chunks to IndexedDB, so a crash never loses audio.
+- The client uses `audio/webm;codecs=opus` or falls back to `audio/mp4`, which covers iOS.
+
+**Tray interactions:**
+
+- Tap a row to edit inline, including a date chip with Today, Tomorrow, a weekday list, and a picker.
+- Swipe or ✕ to reject a row.
+- Change rows show a before → after diff, such as "Tue → Fri".
+- A duplicate notice row reads "Already on Tuesday".
+- If the user keeps talking, the tray updates in place and changed fields flash.
+- Unapplied pending items show as a banner on the Day view: "4 suggestions waiting".
+
+### 10.3 Visual direction
+
+- **Calm and premium.** A warm neutral background, one accent color, generous spacing, and a type pairing that renders Arabic well (for example IBM Plex Sans Arabic with Inter, or similar).
+- **Motion:** subtle springs for checkbox completion and tray items sliding in. `prefers-reduced-motion` is respected.
+- **Themes:** both dark and light, with dark likely the default at night.
+- **Text direction:** `dir="auto"` on every user- or AI-generated string. Logical CSS properties are used throughout, so an Arabic UI in V1 is a translation job, not a re-layout.
+
+### 10.4 Frontend structure
+
+- `app/(auth)` for login and register. `app/(app)` holds `today/[date]`, `talk`, and `settings`.
+- `features/recorder` contains the state machine, MediaRecorder adapter, IndexedDB buffer, and waveform.
+- `features/conversation` covers messages and the tray. `features/tasks` covers the Day view, task row, and edit sheet.
+- `lib/api` holds the generated client and TanStack Query hooks. Checkbox toggles are optimistic and roll back on error.
+- Component tests use Vitest and Testing Library. End-to-end tests use Playwright with fake media streams.
+
+## 11. AI reliability, privacy, security & observability
+
+**Reliability:**
+
+- Validation pipeline as in §7.5.
+- Pinned model and prompt versions. Every run records both.
+- An evaluation gate on any change (§12).
+- A provider fallback chain for STT and LLM.
+- Graceful degradation, so the user message is always saved.
+- A circuit breaker using Polly or `Microsoft.Extensions.Http.Resilience` for provider calls.
+
+**Privacy:**
+
+- No audio is stored. Audio is streamed to the provider and discarded.
+- Transcript retention is user-controlled. Evidence quotes are short and removed with their conversation.
+- There is a privacy screen explaining which processors handle data.
+- Providers are used only under API terms with no training and limited retention.
+- Data export and account deletion are available.
+- Emotional content is never persisted beyond the transcript itself, and never becomes memory.
+
+**Security:**
+
+- Identity cookie that is HttpOnly, Secure, and SameSite=Lax, with an antiforgery token header on mutations.
+- Per-user query filters, verified by tests.
+- Upload validation: MIME sniffing, 25 MB limit, 5 min limit.
+- Rate limits.
+- Secrets live in the host secret store.
+- Dependency scanning with Dependabot or `dotnet list package --vulnerable` and `npm audit` in CI.
+- Prompt injection risk is low because the input is the user's own speech. Even so, model output is always treated as untrusted data. It can never call tools or reach other users' data, because its only power is proposing ops against aliases scoped to that user.
+
+**Observability:**
+
+- One OpenTelemetry trace per turn, with spans for transcribe, analyze (provider, model, tokens), validate, and persist.
+- Metrics: STT and LLM latency p50/p95, validation drop rate by reason, fallback rate, tray acceptance rate, item reject and edit rates, duplicate-blocked count, and cost per session.
+- Logs are structured. Transcripts and titles are **redacted** and only IDs and lengths are logged.
+- `analysis_runs` doubles as the AI audit trail and the source for production evaluation sampling, used only with user consent in the beta.
+
+## 12. Testing & evaluation strategy
+
+### 12.1 Test layers
+
+| Layer                      | Scope                                                                                                                                                 | Tools                                           |
+| :------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------- | :---------------------------------------------- |
+| Domain unit                | DateResolver as a large table across day boundary, DST, weekdays, and year wrap. Normalizer. Policy matrix. Lifecycle transitions. Dedupe thresholds. | xUnit, NodaTime FakeClock                       |
+| Application unit           | Validation pipeline with canned model outputs (valid, invalid, hallucinated alias, bad evidence). Apply logic.                                        | xUnit, fake ITurnAnalyzer                       |
+| API integration            | Endpoints, auth, user isolation, idempotency (concurrent duplicate requests), If-Match conflicts, rate limits                                         | WebApplicationFactory + Testcontainers Postgres |
+| DB                         | Migrations apply cleanly. Unique constraints hold under concurrency. Trigram index works. Retention purge.                                            | Testcontainers                                  |
+| Structured output contract | Recorded real provider responses replayed through the validator, so CI stays deterministic                                                            | Snapshot fixtures                               |
+| AI evaluation (live)       | Golden conversations against the real STT and LLM, scored automatically                                                                               | `Eval` console project + report                 |
+| Frontend                   | Recorder state machine, tray editing, optimistic toggles, RTL rendering                                                                               | Vitest, Testing Library                         |
+| E2E                        | Voice → tray → apply → Day view, using an injected audio file as a fake mic, plus a retry/offline upload case                                         | Playwright (Chromium fake media, WebKit smoke)  |
+
+### 12.2 Evaluation metrics & MVP release gate
+
+**Golden set:** at least 60 conversations, in text form plus audio for at least 30. Each case has a fixed clock, timezone, existing tasks, pending tray, and expected ops. Expected creates are matched to actual creates by an LLM judge, spot-checked by a human, or by keyword sets for simple cases.
+
+| Metric                        | Definition                                                                          | MVP gate                        |
+| :---------------------------- | :---------------------------------------------------------------------------------- | :------------------------------ |
+| Create precision              | Correct definite creates ÷ all pre-checked creates                                  | ≥ 0.90                          |
+| Create recall                 | Expected definite tasks found, pre-checked or maybe, ÷ expected                     | ≥ 0.85                          |
+| False-task rate               | Share of conversations with ≥ 1 invented or aspiration-as-definite pre-checked item | ≤ 5%                            |
+| Modify-op accuracy            | Correct op type **and** correct target ÷ expected modify ops                        | ≥ 0.90                          |
+| Wrong-target rate             | Modify ops hitting the wrong task                                                   | ≤ 2%                            |
+| Date accuracy                 | Resolved date equals expected                                                       | ≥ 0.97                          |
+| Duplicate inserts on retry    | Duplicates from replayed requests                                                   | **0** (hard)                    |
+| Semantic duplicate miss       | The same task re-mentioned produces a new pre-checked create                        | ≤ 3%                            |
+| Clarification appropriateness | Asked when expected and not asked when not, scored by a human                       | ≥ 0.80                          |
+| STT entity accuracy           | Names and English terms correct in transcripts                                      | Tracked; drives provider choice |
+| Latency                       | Stop → tray p50/p95 (60 s clip)                                                     | ≤ 5 s / ≤ 10 s                  |
+
+**Product metrics in beta:** tray acceptance rate, items edited after apply within 24 h, and the share of sessions where the user rejects everything. That last one is the "it got it wrong" signal.
+
+### 12.3 Acceptance scenarios (clock: Mon 2026-11-23 22:30 Cairo unless noted)
+
+| #   | Situation / utterance                                                                   | Expected                                                                                                                                                                                                                             |
+| :-- | :-------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| S1  | The brief's full example (AI project, 2 OS lectures, Ahmed, Docker "مش عارف هلاقي وقت") | Pre-checked for Tue 24 Nov: Finish AI project section (high), Review OS lecture 1, Review OS lecture 2, Reply to Ahmed about the project. Maybe: Start learning Docker. One question about Docker. No task from "مخلصتش اللي ورايا". |
+| S2  | "عندي امتحان OS بكرة الساعة ١٠"                                                         | Zero ops. The reply offers to add a review task.                                                                                                                                                                                     |
+| S3  | "لازم أراجع الفصل التالت قبل امتحان بكرة"                                               | Create "Review chapter 3", scheduled today (Mon 23), with deadline Tue 24.                                                                                                                                                           |
+| S4  | Existing T "Start learning Docker" on Tue. "بكرة مش هعمل Docker، خليها الجمعة"          | reschedule_task T → Fri 27 Nov. No create.                                                                                                                                                                                           |
+| S5  | The tray has pending "Review OS lecture 3". "لا أنا قصدي محاضرة 4 مش محاضرة 3"          | revise_proposal → "Review OS lecture 4". The tray still has 1 item.                                                                                                                                                                  |
+| S6  | Same as S5, but the item was already applied as a task                                  | update_task title → lecture 4, shown as a change row.                                                                                                                                                                                |
+| S7  | Existing "Reply to Ahmed". "خلصت الرد على أحمد خلاص"                                    | complete_task.                                                                                                                                                                                                                       |
+| S8  | Existing "Gym" on Tue. "مش هروح الجيم بكرة خلاص"                                        | cancel_task, not reschedule.                                                                                                                                                                                                         |
+| S9  | Existing "Reply to Ahmed" on Tue. "ومتنساش أرد على أحمد"                                | No new item. Notice "Already on Tuesday".                                                                                                                                                                                            |
+| S10 | "هسلم الريبورت بعد بكرة"                                                                | Create on Wed 25 Nov.                                                                                                                                                                                                                |
+| S11 | "هقابل الدكتور الخميس الجاي" (Mon) and the same phrase said on Thu 26 Nov               | Thu 26 Nov in the first case, Thu 3 Dec in the second. The tray shows the explicit date.                                                                                                                                             |
+| S12 | Clock Tue 24 Nov 00:45. "بكرة لازم أخلص الـ slides"                                     | Scheduled **Tue 24 Nov**, the day-boundary rule.                                                                                                                                                                                     |
+| S13 | "عايز أعمل deploy للـ backend وأكتب الـ unit tests بكرة"                                | 2 creates with English terms preserved: "Deploy the backend" and "Write unit tests".                                                                                                                                                 |
+| S14 | "نفسي أبدأ أقرأ كتب أكتر"                                                               | Zero pre-checked items. At most one Maybe, or a mention in the reply only.                                                                                                                                                           |
+| S15 | "يومي كان وحش جدًا وأنا مخنوق ومش عايز أتكلم في حاجة"                                   | Zero ops. An empathetic reply with no productivity push.                                                                                                                                                                             |
+| S16 | 9 tasks with stated durations totaling 11 h for Tue                                     | All extracted. Workload is "over by 5h" and the reply suggests moving low-priority items.                                                                                                                                            |
+| S17 | STT gives "أراجع محاضرة الأوبريتنج سيستمز" (transliterated)                             | Title "Review Operating Systems lecture".                                                                                                                                                                                            |
+| S18 | Transcript misheard "أمجد" for "أحمد". The user edits the bubble.                       | The new revision supersedes the pending item. The final tray has 1 "Reply to Ahmed". No duplicate.                                                                                                                                   |
+| S19 | Network drops after the server applied items, and the client retries apply              | The same task IDs are returned and the task count is unchanged.                                                                                                                                                                      |
+| S20 | Two existing tasks contain "lecture". "أجّل المحاضرة لبكرة"                             | No modify op. A clarification asks which lecture.                                                                                                                                                                                    |
+| S21 | Tue morning: "انقل اللي مخلصتهوش امبارح للنهاردة"                                       | Change rows rescheduling each pending Mon task to Tue. defer_count goes up by 1.                                                                                                                                                     |
+| S22 | An English-only conversation: "Tomorrow I need to call the bank and maybe hit the gym"  | Pre-checked "Call the bank". Maybe "Go to the gym".                                                                                                                                                                                  |
+| S23 | "تلات محاضرات Networks لازم أذاكرهم الأسبوع ده"                                         | 3 creates. The date is unresolved within the week, so the items go to Later with a question about which days.                                                                                                                        |
+| S24 | The user deletes the conversation from S1                                               | Messages, runs, and evidence are removed. The 4 tasks remain with source_message_id = null.                                                                                                                                          |
+| S25 | Upload of the same audio twice (same uploadId)                                          | One transcription row and one STT provider call.                                                                                                                                                                                     |
+
+## 13. Phased roadmap & dependencies
+
+```mermaid
+flowchart LR
+  P0[Phase 0\nFeasibility & eval harness] --> P2
+  P1[Phase 1\nBackend foundation] --> P2[Phase 2\nConversation + AI pipeline]
+  P1 --> P4
+  P0 --> P3[Phase 3\nVoice capture & STT]
+  P1 --> P3
+  P2 --> P4[Phase 4\nFrontend app]
+  P3 --> P4
+  P4 --> P5[Phase 5\nHardening & private beta]
+  P5 --> V1[V1] --> V2[V2]
+
+```
+
+Phases 0 and 1 run in parallel. The frontend can start against mocked, OpenAPI-generated clients once the §9 contract is frozen at the end of Phase 1.
+
+| Version         | Themes                                                                                                                                                                                                                                                                                                     |
+| :-------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **MVP** (P0–P5) | The full voice → tray → checklist loop, privacy basics, eval gate                                                                                                                                                                                                                                          |
+| **V1**          | Arabic UI. Optional auto-apply with undo. SSE-streamed replies. Rolling session summary. Task breakdown into subtasks and dependencies. Smarter overload suggestions. History screen. Offline checklist and queued toggles. Google sign-in. Learned preferences (with confirmation). Optional TTS replies. |
+| **V2**          | Streaming STT with live transcript. Duplex voice conversation (SignalR/WebRTC). Opt-in long-term memory. Reminders and web push. Calendar integration. Recurring tasks. Weekly reflection insights. Self-hosted or fine-tuned Egyptian STT if cost or privacy requires it. Native wrapper.                 |
+
+## 14. Phase tasks & acceptance criteria
+
+**Phase 0 — Feasibility & evaluation harness (the go/no-go)**
+
+- Tasks:
+  - Write the golden set: 60 text cases, including §12.3. Record 40 audio clips from 4–6 speakers.
+  - Create the solution skeleton with only `Domain`, `Application`, and `Eval`.
+  - Implement DateResolver, Normalizer, the validation pipeline, and Policy, all pure.
+  - Write ITurnAnalyzer adapters for 2 LLM vendors and ITranscriber adapters for 3 STT candidates.
+  - Write prompt v1. Build the eval runner, which outputs a markdown report with the §12.2 metrics, per-case diffs, latency, and cost.
+- Acceptance:
+  - The eval runs with one command.
+  - Domain unit tests are green, with the DateResolver table at 50+ rows or more.
+  - A written STT and LLM selection appears in `decisions.md` with numbers.
+  - The §12.2 gate is met on text input, or there is a documented plan with a re-test.
+  - **If it misses badly, the product approach is revisited before building the UI.**
+
+**Phase 1 — Backend foundation**
+
+- Tasks:
+  - `Infrastructure` + `Api` projects, plus Docker Compose with Postgres.
+  - EF model and migrations for §8, including the pg_trgm extension.
+  - Identity auth, invite codes, and the settings endpoint.
+  - Task CRUD and lifecycle endpoints, the day endpoint with workload, and move-unfinished.
+  - Idempotency middleware, Problem Details, rate limiter, and OpenTelemetry plus Serilog redaction.
+  - OpenAPI document and CI with build, tests, and Testcontainers.
+- Acceptance:
+  - Integration tests cover user isolation, concurrent duplicate POSTs, If-Match conflicts, and lifecycle rules.
+  - OpenAPI is published and the TS client generates cleanly.
+  - `docker compose up` gives a working API locally.
+
+**Phase 2 — Conversation & AI pipeline in the API**
+
+- Tasks:
+  - Conversations and messages endpoints, the context builder with aliases, and analysis run persistence.
+  - Tray endpoints for edit and apply, message edit with supersede, and retry analysis.
+  - The provider fallback chain and resilience policies.
+- Acceptance:
+  - Scenarios S1–S11, S13–S16, S18–S20, and S22–S24 pass as API-level tests with recorded model outputs.
+  - The live eval still meets the gate.
+  - Concurrent apply of the same items produces exactly one task each.
+
+**Phase 3 — Voice capture & STT**
+
+- Tasks:
+  - The transcription endpoint with streaming upload to the provider and no disk persistence.
+  - Vocabulary prompt biasing from task titles.
+  - The client recorder state machine, IndexedDB chunk buffer, MIME negotiation, waveform, wake lock, and 5-minute cap.
+- Acceptance:
+  - Works on Chrome Android and iOS Safari, both in the browser and as an installed PWA.
+  - Killing the tab mid-upload and reopening offers a retry with the audio intact.
+  - S25 passes.
+  - Stop → transcript p95 ≤ 5 s for a 60 s clip.
+
+**Phase 4 — Frontend app**
+
+- Tasks:
+  - Auth screens, the Day view with Today/Tomorrow and date picker, task row and edit sheet, and optimistic toggles.
+  - The Talk sheet with conversation, tray, inline edit, apply, clarifications, and the duplicate notice.
+  - Settings & Privacy.
+  - RTL and dark/light themes, reduced-motion support, and PWA manifest and service worker.
+- Acceptance:
+  - J1–J6 can be completed on a phone.
+  - axe has no critical violations.
+  - Playwright E2E passes the voice → tray → apply → Day view flow with a fake mic.
+  - Arabic text renders correctly in all components.
+
+**Phase 5 — Hardening & private beta**
+
+- Tasks:
+  - Retention purge job, export, and delete account.
+  - Cost and latency dashboards and budget alerts.
+  - Error-state polish and a privacy explainer.
+  - Deploy with Caddy, the container host, and managed Postgres, plus a backup and restore drill.
+  - Onboard 5–20 beta users with consent for evaluation sampling, and run a weekly eval-gap review.
+- Acceptance:
+  - S12, S17, and S21 pass, as do all §12.3 scenarios end-to-end.
+  - A restore from backup is verified.
+  - Two weeks of beta reach a tray acceptance rate of at least 80% and zero duplicate-task incidents.
+
+## 15. Technical risks, open decisions & mitigations
+
+**Risks:**
+
+| Risk                                                | Likelihood / impact | Mitigation                                                                                                                                                   |
+| :-------------------------------------------------- | :------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| STT quality on Egyptian code-switching is too low   | Med / High          | Phase 0 bake-off measured on downstream task F1. Vocabulary biasing. Editable transcript. The LLM is robust to transliteration. Self-hosted fine-tune in V2. |
+| LLM over-extracts (invents or promotes aspirations) | Med / High          | Evidence check, commitment classes, Maybe section, review-before-apply, and the false-task metric in the gate.                                               |
+| Wrong target on modify ops                          | Med / High          | Aliases, a clarification on ambiguity, explicit change rows, and nothing applied without a tap.                                                              |
+| Off-by-one dates at night or across DST             | Med / Med           | A deterministic resolver with a large test table and explicit date display.                                                                                  |
+| iOS PWA mic and MediaRecorder quirks                | High / Med          | Early device testing in Phase 3, an MP4 fallback, and a text input fallback.                                                                                 |
+| Provider deprecation or price change                | Med / Med           | Ports and adapters, pinned versions, and the eval gate on swap.                                                                                              |
+| Latency over 10 s on long clips                     | Med / Med           | 5-minute cap, the fastest acceptable STT, prompt caching, a small context, and the 2-step UI so progress is visible.                                         |
+| Two-stack overhead slows a solo developer           | Med / Med           | Lean structure, generated types, same-origin deploy, and decision D-01 as an escape hatch.                                                                   |
+| Privacy perception ("it listens to my feelings")    | Med / High          | No audio storage, a clear retention control, deletion, and no long-term memory in the MVP.                                                                   |
+| Scope creep into a productivity super-app           | High / Med          | The non-goals list and the V1/V2 parking lot.                                                                                                                |
+
+**Open decisions** (each has a default, so work is not blocked):
+
+| ID   | Decision                               | Default                                                                                |
+| :--- | :------------------------------------- | :------------------------------------------------------------------------------------- |
+| D-01 | ASP.NET Core vs all-TypeScript backend | ASP.NET Core (preference). Switch if C# isn't a strength.                              |
+| D-02 | STT provider                           | Decided by the Phase 0 bake-off                                                        |
+| D-03 | LLM provider and model                 | Decided by the Phase 0 eval                                                            |
+| D-04 | Task title language                    | English titles, with a setting for Arabic or match-speech                              |
+| D-05 | Arabic UI in MVP?                      | No. English UI, RTL-safe content, Arabic UI in V1.                                     |
+| D-06 | Auto-apply vs review                   | Review with one tap in the MVP. Opt-in auto-apply in V1 if precision is at least 0.95. |
+| D-07 | Transcript retention default           | 30 days                                                                                |
+| D-08 | Hosting provider and region            | A container host plus managed Postgres in an EU region                                 |
+| D-09 | Beta access                            | Invite-only                                                                            |
+| D-10 | Day boundary default                   | 04:00, user-adjustable                                                                 |
+
+## 16. Recommended first implementation milestone
+
+**Milestone 1 = Phase 0: "The Egyptian Arabic extraction proof", built inside the real backend solution.**
+
+It produces a .NET solution with `Domain`, `Application`, and `Eval` projects only, plus:
+
+- the golden dataset of 60 text cases and 40 audio clips
+- DateResolver, Normalizer, validator, and policy with full unit tests
+- adapters for 2 LLMs and 3 STT candidates
+- a one-command eval report
+
+**Why first:** Everything else is ordinary CRUD and UI that is known to be buildable. The only thing that can sink the product is whether a dialect conversation reliably becomes the right checklist. This milestone answers that in about a week of work, and none of it is throwaway, because it becomes the production domain core and the permanent regression gate.
+
+**Done when:** The §12.2 gate is met on text, and the STT and LLM choices are recorded with evidence. Phase 1 starts after that.
+
+## 17. Delivery on approval (still planning, no code)
+
+On approval, I will create these Markdown files from this plan's sections. I will not write code, install dependencies, or run `git init` unless asked.
+
+| File                             | Sections                                                                                      |
+| :------------------------------- | :-------------------------------------------------------------------------------------------- |
+| `docs/README.md`                 | Index and reading order                                                                       |
+| `docs/product-requirements.md`   | Part A, §1–§4                                                                                 |
+| `docs/architecture.md`           | §5, §6, and the observability part of §11                                                     |
+| `docs/ai-pipeline.md`            | §7 and the reliability part of §11                                                            |
+| `docs/database-design.md`        | §8                                                                                            |
+| `docs/api-contract.md`           | §9                                                                                            |
+| `docs/ui-ux-plan.md`             | §10                                                                                           |
+| `docs/testing-strategy.md`       | §12                                                                                           |
+| `docs/implementation-roadmap.md` | §13, §14, §16                                                                                 |
+| `docs/decisions.md`              | ADR-style entries for A.2 pushbacks, D-01 to D-10 with status, and the risk register from §15 |
+
+## Verification
+
+- Every `/docs` file exists and every one of the 16 requested deliverables maps to a section (cross-check against the §17 table).
+- All Mermaid blocks render. Check them in the VS Code Markdown preview or GitHub, with a flowchart, sequence diagram, and ER diagram.
+- The documents agree with each other on:
+  - entity and field names (§8 vs §9 vs §7.3)
+  - op type names
+  - status enums
+  - every scenario's dates against the stated clock (2026-11-23 is a Monday)
+- No application code, package manifests, or installed dependencies exist in the repo after the docs step.
